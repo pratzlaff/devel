@@ -1,0 +1,2436 @@
+#! /usr/bin/perl
+
+
+=head1 NAME
+
+tg_reprocess - Reprocess Chandra data
+
+=head1 SYNOPSIS
+
+tg_reprocess [options] I<dir>
+
+=head1 DESCRIPTION
+
+This script attempts to automatically reprocess data according to the
+procedures recommended by the various CXC Science Threads for CIAO 4.4
+
+Supported instrument configurations at this time are ACIS-S/I and
+HRC-S/I, with either grating.
+
+The input is a directory name (F<dir>) in which output data files from
+standard processing exist, which are then used as a basis for the
+reprocessing. The F<dir> given should contain output for a single
+obsid only, and the filenames are expected to be unchanged from those
+created by standard processing. As a special case, sub-directories
+under F<dir>, named F<primary>, F<secondary> and F<secondary/aspect> are
+also searched, since these are where Chaser stores retrieved data.
+
+Files generated from the reprocessing are created in their own
+sub-directory F<dir/tg_reprocess> by default This can be changed with
+the I<--outdir> option.
+
+Steps taken during reprocessing can be controlled with the I<--lstart>
+and I<--lend> options. These options can take values C<1>, C<1.5> and
+C<2>. By default I<--lstart=1> and I<--lend=2>. Some examples:
+
+=over 4
+
+=item * Reprocess L1 only
+
+	--lend=1
+
+=item * Reprocess L1.5 and L2
+
+	--lstart=1.5
+
+=item * Reprocess L1.5 only
+
+	--lstart=1.5 --lend=1.5
+
+=back
+
+FIXME: the following description is incorrect
+
+Standard processing files expected to exist under F<dir> depend on the
+instrument configuration and reprocessing levels being done.
+
+For ACIS-S, the files required for any level of reprocessing are
+B<flt1>, B<pcad/asol1> and B<bpix1>. Additionally, the pre-existing
+B<evt1> file is required if L1 or L1.5 reprocessing will be done, and
+the pre-existing B<evt1a> data are required if only L2 reprocessing
+will be performed.
+
+For HRC-S, the files required for any level of processing are B<evt1>,
+B<pcad/asol1> and B<bpix1>.  If L2 reprocessing is the only level
+being performed, B<std_flt1>, B<evt1a> and B<dtf1> files are required.
+
+=head2 ACIS REPROCESSING STEPS
+
+=over 4
+
+=item Download
+
+download_chandra_obsid 8378 evt1,bpix,pbk,msk,flt,asol,bias,stat,mtl
+
+=item * L1 acis_clear_status_bits
+
+=item * L1 run destreak on the ACIS-S4 chip
+
+Disable with I<--nodestreak>.
+
+=item * L1 acis_process_events
+
+Generate new I<evt1> list with I<acis_process_events> and the most
+up-to-date gain map. At this stage the B<--norandpha> and
+B<--norandpix> options can be given to specify that pha and/or pixels
+should not be randomized (both are randomized by default). The latest
+gain map is chosen by default when the focal plane temperature is
+detected to be -120C, but a specific gain mapping can be specified
+with B<--gainfile=path>.
+
+=item * L1.5
+
+Grating coordinates are generated with I<tgdetect>, I<tg_create_mask>
+and I<tg_resolve_events>.
+
+=item * L2
+
+Filter I<evt1a> event list on grades and standard filters. Run
+I<tgextract> to generate specrum.
+
+=item * create data plots
+
+Run I<chips_tgscript.ch> if B<--chips> option was specified.
+
+=item * generate grating RMF
+
+Run I<mkgrmf>.
+
+=item * generate garfs
+
+Run I<fullgarf> and I<combine_grating_spectra>. This step can be disabled
+with the B<--nogarf> option.
+
+NOTE: need here a warning of absence of dead area correction and
+maskfile parameters to mkgarf (via fullgarf).
+
+=back
+
+
+=head2 HRC-S REPROCESSING STEPS
+
+=over 4
+
+=item Download
+
+download_chandra_obsid 13025 evt1,bpix,msk,flt,asol,dtf
+
+=item * L1
+
+Generate new B<evt1> file with I<hrc_process_events>. Options
+affecting this step are B<--randpix>, which specifies that pixels
+should be randomized. If CIAO version 2.3 is detected or
+B<--obspar> is specified, a workaround for a bug is invoked whereby a
+B<obs.par> file is generated and passed as a parameter to
+I<hrc_process_events>. If it is determined that B<do_amp_sf_cor> was not
+previously applied to the existing B<evt1> list, then that correction
+is performed as well. One can also force B<do_amp_sf_cor>, even though the
+AMPSFCOR value in the evt1 header indicates it has already been done, by
+specifying B<--force_amp_sf_cor>. A custom degap file can be used with the
+I<--degapfile> option.
+
+=item * L1.5
+
+Grating coordinates are generated with I<tgdetect>, I<tg_create_mask>
+and I<tg_resolve_events>.
+
+=item * L2
+
+The B<evt1a> file is filtered on pulse-height unless
+B<--pifilter=none> was given, and a B<back_evt1a> file is
+written. GTI-filtering is then applied and the result is a
+B<flt1_evt1a> event list. Finally the thread-recommended status bit
+filtering is applied and B<evt2> data are written.
+
+FIXME: Options affecting
+this step are B<--pifilter>.
+
+=item * generate grating RMF
+
+Run I<mkgrmf>.
+
+=item * generate garfs
+
+Run I<fullgarf> and I<combine_grating_spectra>. This step can be disabled
+with the B<--nogarf> option.
+
+=back
+
+=head1 OPTIONS
+
+=over 4
+
+=item --help
+
+Show help and exit.
+
+=item --version
+
+Show version and exit.
+
+=item --debug
+
+Enable stack backtraces for warnings and errors.
+
+=item --errignore
+
+When an unsuccessful status code is returned from a CIAO tool
+(hrc_process_events, dmcopy, etc), the default action of tg_reprocess is
+to stop immediately. With this option enabled, any error is ignored and
+tg_reprocess attempts to carry on, oblivious of the problem.
+
+=item --noexec
+
+Do not execute commands. Useful for seeing exactly what will be done.
+
+=item --outdir=s
+
+Output directory to which new files are written.  This path will be
+created under the directory which is being processed. Default value is
+F<tg_reprocess>.
+
+=item --orders=i
+
+By default the extracted spectrum for HRC grating observations
+contains orders +/- 1 and for ACIS grating observations the extracted
+spectrum contains orders +/- 1,2,3. Use of this option extracts +/-
+orders up through the argument given. For example, --orders=10
+extracts orders +/- 1 through 10.
+
+=item --pifilter=s (HRC-S only)
+
+HRCS/LETG PI filter. The default value of C<pi> would normally be
+used, or C<none> can be specified if no PI filtering is
+desired. Legacy filters, used with versions of CIAO older than 4.2, are
+C<light> (the previous default), C<medium> and C<heavy>.
+
+If the argument doesn't match any of these, it is assumed to be the
+actual filter filename, which will be filtered on columns (pi,tg_mlam).
+
+=item --grating=[lhn]
+
+Do not autodetect grating type.
+
+=item --degapfile=s
+
+Pass the given degapfile along to I<hrc_process_events>.
+
+=item --obspar
+
+Create an obs.par file to use with hrc_process_events. Enabled automatically
+if the CIAO version detected is 2.3, in order to work around a bug in that
+version.
+
+=item --allcols
+
+Retain the following columns through L2 for HRC events:
+
+    CRSV, CRSU, AV, AU, RAW, AMP_SF, SUMAMPS
+
+=item --tfilter=tstart,tstop
+
+Filter the L2 event list use only those events whose times are in the
+range [tstart, tstop]. For example, --tfilter=442502018,442502399
+
+=item --dtffilter=f
+
+Filter the HRC evt2 for dtf greater than the given value.
+
+=item --[no]randpix
+
+Specify rand_pix_size=0 or rand_pix_size=0.5 for {acis,hrc}_process_events.
+
+=item --norandpha
+
+Do not apply PHA randomization when running acis_process_events.
+
+=item --noafterglow (ACIS only)
+
+Remove afterglow events.
+
+=item --temp=[-110,-120] (ACIS only)
+
+Do not autodetect focal plane temperature.
+
+=item --nodestreak (ACIS only)
+
+Do not generate destreaked L2 files.
+
+=item --gainfile=s
+
+Specify which gainfile to use in hrc/acis_process_events.
+
+=item --geompar=s
+
+Specify geompar file to use. The path should be absolute, as
+F<tg_reprocess> changes directories before running CIAO commands. Also
+note that the pathnames in the param file should be absolute (the
+I<instruments> geometry parameter, for instance).
+
+=item --osipugh
+
+For ACIS grating observations, call I<tg_resolve_events> with
+C<osip=none osort_lo=0.2 osort_hi=0.3>.
+
+=item --osort_lo=f
+
+Along with --osipugh, specify osort_lo rather than the use default value of 0.1
+
+=item --osort_hi=f
+
+Along with --osipugh, specify osort_hi rather than use the default value of 0.3
+
+=item --chips (ACIS only)
+
+Run the Chips script which generates plots.
+
+=item --sA_zero[xy]=f
+
+Pass these along to F<tg_create_mask> rather than using the detected
+source position for zeroth order.
+
+=back
+
+=head1 SEE ALSO
+
+http://cxc.harvard.edu
+
+=head1 AUTHOR
+
+Pete Ratzlaff E<lt>pratzlaff@cfa.harvard.eduE<gt> May 2012
+
+=cut
+
+use warnings;
+use strict;
+
+use constant NONE       =>  0;
+use constant LETG	=>  1;
+use constant HETG	=>  2;
+use constant ACIS	=>  3;
+use constant HRC	=>  4;
+use constant ACIS_I	=>  5;
+use constant ACIS_S	=>  6;
+use constant HRC_I	=>  7;
+use constant HRC_S	=>  8;
+
+
+# TODO:
+#   filename class is full of holes
+
+my $version = '0.1';
+
+use Config;
+use Cwd;
+use File::Basename;
+use FindBin;
+use File::Path;
+use Carp;
+use File::Temp;
+
+use Getopt::Long;
+my %default_opts = (
+		    outdir => 'tg_reprocess',
+		    'exec' => 1,
+#		    'randpix' => 1,
+		    destreak => 1,
+		    pifilter => 'none', # 'pi',
+		    lstart => 1,
+		    lend => 2.5,
+		    grmf => 0,
+		    garf => 1,
+		    stop => 'none',
+		    chips => 0,
+		    modpireg => 0,
+#		    orders => # default will be 1 for hrc, 3 for acis
+		    tgmseq => 0, # how to order tg_m in the output pha2
+		    osort_lo => 0.2,
+		    osort_hi => 0.3,
+		    );
+my %opts = %default_opts;
+GetOptions(\%opts,
+	   'help!', 'version!', 'debug!', 'exec!',
+	   'grating=s', 'temp=i',
+	   'randpix!', 'randpha!', 'gainfile=s', 'qefile=s', 'qeufile=s', 'lsfparmfile=s', 'outdir=s', 'destreak!',
+	   'pifilter=s', 'pifilename=s', 'grmf!', 'garf!', 'lstart=s', 'lend=s', 'stop=s',
+	   'chips!', 'obspar!', 'geompar=s', 'errignore!',
+	   'allcols!', 'force_amp_sf_cor!', 'modpireg!',
+	   'degapfile=s', 'orders=i',
+	   'osipugh!', 'osort_lo=f', 'osort_hi=f', 'tgmseq=i',
+	   'tfilter=s', 'dtffilter=s',
+	   'min_bin_leg=f', 'max_bin_leg=f', 'bin_size_leg=f', 'num_bins_leg=i',
+	   'sA_zero_x=f', 'sA_zero_y=f',
+	   'qeversion=s', 'qeuversion=s', 'lsfparmversion=s',
+	   'badpix=s',
+	   ) or die "Try `$0 --help' for more information.\n";
+
+if ($opts{debug}) {
+  $SIG{__DIE__} = \&Carp::confess;
+  $SIG{__WARN__} = \&Carp::cluck;
+}
+
+$opts{help} and _help();
+$opts{version} and _version();
+
+$opts{tgmseq} == 0 or $opts{tgmseq} == 1 or die "invalid --tgmseq=$opts{tgmseq}";
+
+$opts{garf} = 0 unless $opts{grmf};
+
+# for additional time filter
+my ($tstart, $tstop);
+if ($opts{tfilter}) {
+  ($tstart, $tstop) = eval $opts{tfilter};
+  die "$0: error evaluating --tfilter expression '$opts{tfilter}'\n\t$@\n" if $@;
+}
+
+if (defined $opts{orders}) {
+  $opts{orders} >= 1 and $opts{orders} <= 25
+    or die "specified --orders must be in the range [1, 25]\n";
+}
+
+@ARGV or die "invalid arguments\nTry `$0 --help' for more information\n";
+
+# validity of lstart and lend
+for (qw( lstart lend )) {
+  for my $l ($opts{$_}) {
+    $l == 1 or $l == 1.5 or $l == 2 or $l == 2.5
+      or die "$_ = $l is invalid, must be 1, 1.5, 2 or 2.5\n";
+  }
+}
+
+exists $opts{badpix} and $opts{lstart}=1;
+
+$opts{lstart} <= $opts{lend} or die "lstart must be <= lend\n";
+
+$ENV{CALDB} or die "CALDB not set, CIAO environment required\n";
+$ENV{ASCDS_INSTALL} or die "ASCDS_INSTALL not set, CIAO environment required\n";
+
+my $ciao_version = ciao_version();
+
+# CIAO scripts
+
+# ASCDS_CONTRIB env variable used to be set, as of 4.1.2 it's instead
+# just a normal (non-env) variable...
+my $contrib = $ENV{ASCDS_INSTALL} . '/contrib';
+
+my $fullgarf = "$contrib/bin/fullgarf";
+my $chips_tgscript = "$contrib/interpreted/chips_tgscript.ch";
+my $get_evt = "$contrib/interpreted/get_evt_data.sl";
+
+-e $_ or die "$_ not found"
+  for ( ($opts{chips} ? ($chips_tgscript, $get_evt) : () ),
+	($opts{garf} ? ($fullgarf) : () ),
+      );
+
+my $pdir = pdir_temp();
+warn "using parameter directory $pdir\n";
+
+_process_directory($_) for @ARGV;
+
+exit 0;
+
+sub _dolevel {
+  return($_[0] >= $opts{lstart} and $_[0] <= $opts{lend});
+}
+
+BEGIN {
+  my %subs = (
+	      ACIS() => \&_process_acis_directory,
+	      HRC() => \&_process_hrc_directory,
+	     );
+
+  sub _process_directory {
+    my $old_dir = cwd;
+
+    my $dir = shift;
+    chdir $dir or die "could not chdir($dir): $!";
+
+    my $f = CXCFiles->new('.') or die;
+
+    exists $subs{$f->dettype} or
+      die "unrecognized detector type '".$f->dettype."'";
+    $subs{$f->dettype}->($f);
+
+    chdir $old_dir;
+
+    return;
+  }
+}
+
+sub _process_hrc_directory {
+
+  my $orders = defined $opts{orders} ? $opts{orders} : 1;
+  my @orders = 1..$orders;
+
+#  if (!$opts{randpix} and !_dolevel(1)) {
+#    warn "Enabling L1 processing since norandpix requested\n";
+#    $opts{lstart} = 1;
+#  }
+
+  my $old = shift;
+
+  # needed for all reprocessing levels
+  defined $old->file($_) or die "could not find $_ file"
+    for ('pcadasol1');
+
+  my $header = _header($old->evt1, 'events');
+  my $grating = _grating($header);
+  my $detnam = _detnam($header);
+
+  die "--orders other than 1 is invalid for HRC-I" if $orders!=1 and $detnam == HRC_I;
+
+  # check for existence of other files needed
+  my @required;
+  @required = ('bpix1') unless exists $opts{badpix};
+
+  if (_dolevel(1) or _dolevel(1.5)) {
+    @required = qw( evt1 );
+  }
+  elsif (_dolevel(2) and $grating != NONE) {
+    @required = qw( evt1a );
+  }
+  elsif (_dolevel(2.5) and $grating != NONE) {
+    @required = qw( evt2 );
+  }
+
+  if (_dolevel(2)) {
+    push @required, qw( std_flt1 dtf1 );
+  }
+
+  defined $old->file($_) or die "could not find $_ file"
+    for @required;
+
+  # create output directory
+  if ($opts{exec}) {
+    -d $opts{outdir} or mkpath($opts{outdir}) or
+      die "could not create output directory $opts{outdir}";
+  }
+
+  my $new = $old->copy;
+  $new->incproc;
+  $new->strip_gz;
+  $new->newdir($opts{outdir});
+
+  my ($evt1, $evt1a, $evt2);
+
+  my $bpix1;
+
+  if (_dolevel(1)) {
+
+    $evt1 = $old->evt1;
+
+    my $using_obspar;
+
+    if ($opts{obspar} or $ciao_version =~ /^2\.3/) {
+      $using_obspar = 1;
+    }
+
+    if ($using_obspar or exists $opts{badpix}) {
+      $new->addtype('obs', 1, 'par');
+      _run_command('punlearn', 'dmmakepar');
+      _run_command('dmmakepar', $evt1.'[events]', $new->obs, 'clobber=yes');
+    }
+
+    if (exists $opts{badpix}) {
+      $new->addtype('bpix1', 1);
+      $bpix1 = $new->bpix1;
+      _run_command('punlearn', 'hrc_build_badpix');
+      _run_command('hrc_build_badpix',
+		   $opts{badpix},
+		   $bpix1,
+		   $new->obs,
+		   'degapfile=CALDB',
+		   'clobber=yes'
+		  );
+    }
+    else { $bpix1 = $old->bpix1; }
+
+    my $do_amp_sf = $opts{force_amp_sf_cor} || _needs_ampsfcor($header);
+    my $tmpfile;
+    if ($do_amp_sf) {
+      my ($needs_range, $range) = _needs_rangelev($header);
+
+      # FIXME:
+      # even though RANGELEV may be present in the header, we need to
+      # take these steps due to the presence of extra obspar parameters
+      # in ciaox (range_switch_level and width_threshold)
+      $needs_range = 1 if $using_obspar;
+
+      if ($needs_range) {
+
+	# FIXME: what header keyword will this be if not using obspar?
+	my $width_threshold = _width_threshold($header);
+
+	if ($using_obspar) {
+
+	  print STDERR "# Appending range_switch_level=$range, width_threshold=$width_threshold to ".$new->obs."\n\n";
+
+	  if ($opts{'exec'}) {
+	    # FIXME: should use standard tools to do this
+	    open OBS, '>> '.$new->obs or die 'could not open '.$new->obs.": $!\n";
+	    print OBS qq/range_switch_level,i,h,$range,,,""\n/;
+	    print OBS qq/width_threshold,i,h,$width_threshold,,,""\n/;
+	    close OBS;
+	  }
+
+	}
+
+	else {
+	  $evt1 = $tmpfile = File::Temp->new(DIR=>$opts{outdir}, SUFFIX=>'.fits');
+	  if ($old->evt1 =~ /\.gz$/i) {
+	    _run_command("gzip -cd '".$old->evt1."' > $tmpfile");
+	  }
+	  else {
+	    _run_command('cp', '-f', $old->evt1, $tmpfile);
+	  }
+
+	  # dmhedit needs write permission, files from processing typically
+	  # come down as readable only
+	  if ($opts{exec}) {
+	    chmod 0644, $tmpfile or die "could not chmod $tmpfile: $!";
+	  }
+
+	  _run_command('punlearn', 'dmhedit');
+	  _run_command('dmhedit',
+		       'infile='.$tmpfile,
+		       'filelist=none',
+		       'operation=add',
+		       'key=RANGELEV',
+		       'value='.$range,
+		      );
+	}
+      }
+    }
+
+    my $gainfile;
+    $gainfile = exists $opts{gainfile} ? $opts{gainfile} : hrcs_gainfile($header);
+    _run_command('punlearn', 'hrc_process_events');
+    _run_command('hrc_process_events',
+		 'infile='.$evt1,
+		 'outfile='.$new->evt1,
+		 ($using_obspar ? 'obsfile='.$new->obs : ()),
+		 ($do_amp_sf ? 'do_amp_sf_cor=yes' : ()),
+		 'badpixfile='.$bpix1,
+		 'eventdef=)stdlev1',
+		 'acaofffile='.$old->pcadasol1,
+		 #'alignmentfile='.$old->pcadasol1,
+		 #'instrume='.($detnam==HRC_S?'hrc-s':'hrc-i'),
+		 'clobber=yes',
+		 ($opts{degapfile} ? ('degapfile='.$opts{degapfile}) : ()),
+		 (exists $opts{randpix} ?
+		  ($opts{randpix} ? 'rand_pix_size=0.5' : 'rand_pix_size=0') : ()
+		 ),
+		 ($opts{geompar} ? ("geompar=$opts{geompar}") : () ),
+		 (defined $gainfile ? ("gainfile=$gainfile") : () ),
+		);
+    _run_command('rm', '-f', $tmpfile) if defined $tmpfile;
+    $evt1 = $new->evt1;
+
+    # skip next step of creating evt1a file if there is no grating
+    $evt1a = $evt1 if $grating == NONE;
+  }
+
+  if (_dolevel(1.5) and $grating != NONE) {
+
+    $evt1 = $old->evt1 unless defined $evt1;
+
+    $new->addtype('src1a', 1);
+    my ($x, $y) = _xy_pos($old->evt1, $old->pcadasol1); # use the old file in case noexec was requested
+    _run_command('punlearn', 'tgdetect2');
+    _run_command('tgdetect2',
+		 'infile='.$evt1,
+		 'outfile='.$new->src1a,
+		 'zo_pos_x='.sprintf("%.2f", $x),
+		 'zo_pos_y='.sprintf("%.2f", $y),
+		 'clobber=yes',
+		);
+    #_run_command('punlearn', 'tgdetect');
+    #_run_command('tgdetect',
+		 #'infile='.$evt1,
+		 #'outfile='.$new->src1a,
+		 #'zo_pos_x='.sprintf("%.2f", $x),
+		 #'zo_pos_y='.sprintf("%.2f", $y),
+		 #'OBI_srclist_file=NONE',
+		 #'clobber=yes',
+		#);
+
+    $new->addtype('evt1_L1a', 1);
+    _run_command('punlearn', 'tg_create_mask');
+    _run_command('tg_create_mask',
+		 'infile='.$evt1,
+		 'outfile='.$new->evt1_L1a,
+		 'input_pos_tab='.$new->src1a,
+		 'grating_obs=header_value',
+		 ($opts{geompar} ? ("geompar=$opts{geompar}") : () ),
+		 ((defined $opts{sA_zero_x} or defined $opts{sA_zero_y}) ? ('use_user_pars=yes') : () ),
+		 (defined $opts{sA_zero_x} ? ("sA_zero_x=$opts{sA_zero_x}") : () ),
+		 (defined $opts{sA_zero_y} ? ("sA_zero_y=$opts{sA_zero_y}") : () ),
+		 'clobber=yes',
+		);
+
+    my $eventdef = ')stdlev1_HRC';
+    if ($opts{allcols}) {
+      # combined stdlev1_HRC and the analogue columns
+
+      #
+      # FIXME: bug in current (4.0 and earlier) ciao prevents us from putting
+      #        raw coords into eventdef, so we use a workaround for now (see
+      #        call to dmpaste below
+      #
+
+      $eventdef = '{d:time,s:crsv,s:crsu,s:amp_sf,s:av1,s:av2,s:av3,s:au1,s:au2,s:au3,f:rd,s:chip,l:rawx,l:rawy,l:tdet,f:det,f:sky,s:chip_id,s:pha,s:pi,s:sumamps,s:tg_m,f:tg_lam,f:tg_mlam,s:tg_srcid,s:tg_part,s:tg_smap,x:status}';
+    }
+
+    $new->addtype('evt1a');
+    _run_command('punlearn', 'tg_resolve_events');
+    _run_command('tg_resolve_events',
+		 'infile='.$evt1,
+		 'outfile='.$new->evt1a,
+		 'regionfile='.$new->evt1_L1a,
+		 'acaofffile='.$old->pcadasol1,
+		 'eventdef='.$eventdef,
+		 ($opts{geompar} ? ("geompar=$opts{geompar}") : () ),
+		 'clobber=yes',
+		 'osipfile=none',
+		);
+#     # FIXME: add raw columns to evt1a file, workaround for now (see above FIXME)
+#     if ($opts{allcols}) {
+#       $new->addtype('evt1a_tmp');
+#       _run_command('punlearn', 'dmpaste');
+#       _run_command('dmpaste',
+# 		   $new->evt1a,
+#                    $new->evt1.'[cols raw]',
+# 		   $new->evt1a_tmp,
+# 		   'clobber=yes',
+# 		   );
+#       _run_command('punlearn', 'dmappend');
+#       _run_command('dmappend', $new->evt1a.'[region]', $new->evt1a_tmp);
+#       _run_command('mv', '-f', $new->evt1a_tmp, $new->evt1a);
+#     }
+
+    $evt1a = $new->evt1a;
+
+  }				# if _dolevel(1.5)
+
+  if (_dolevel(2)) {
+
+    if (!defined $evt1a) {
+      $evt1a = $grating == NONE ? $old->evt1 : $old->evt1a;
+    }
+
+    my $region_evt1a = $evt1a;
+
+    if (lc $opts{pifilter} ne 'none' and $detnam == HRC_S) {
+
+      # legacy filters used the TG_LAM column instead of TG_MLAM
+      my $lamcol = $opts{pifilter} eq 'pi' ? 'tg_mlam' : 'tg_lam';
+
+      # background filter
+      if ($grating != LETG) {
+# pha=0:254 is obsolete as of ciao 4.2
+# 	$new->addtype('back_evt1a', 1);
+# 	_run_command('punlearn', 'dmcopy');
+# 	_run_command('dmcopy',
+# 		     $evt1a.'[EVENTS][pha=0:254]',
+# 		     $new->back_evt1a,
+# 		     'opt=all',
+# 		     'clobber=yes',
+# 		    );
+# 	$evt1a = $new->back_evt1a;
+      }
+
+      else {
+	my $pifilter = _hrcs_letg_filter($opts{pifilter});
+
+	# ciao 3.2 bug affecting filtering requires workaround implemented
+	# in http://cxc.harvard.edu/ciao/threads/spectra_letghrcs/modpireg
+	#
+	# the workaround is on by default now, since daily
+	# (/home/ascds/DS.daily/bin/ciao.csh) doesn't always have the
+	# version string we expect
+	if ($opts{modpireg}) {
+	  #      if ($ciao_version =~ /^3\.2/) {
+	  my $old_pifilter = $pifilter;
+	  my ($pifilter_filename) = $old_pifilter =~ /([^\/]+)$/;
+	  $pifilter = "$opts{outdir}/$pifilter_filename";
+	  _run_command('punlearn', 'dmcopy');
+	  _run_command('dmcopy',
+		       'infile='.$old_pifilter.'[cols row_idx,rowid,shape,pi,'.$lamcol.',r,rotang,tg_part,tg_srcid,tg_m,backscal,component]',
+		       "outfile=$pifilter",
+		       'clobber=yes',
+		      );
+	  _run_command('punlearn', 'dmhedit');
+	  _run_command('dmhedit',
+		       "infile=$pifilter",
+		       'filelist=none',
+		       'operation=add',
+		       'key=mform1',
+		       "value='pi,".$lamcol."'",
+		       'mode=hl'
+		      );
+	  _run_command('punlearn', 'dmhedit');
+	  _run_command('dmhedit',
+		       "infile=$pifilter",
+		       'filelist=none',
+		       'operation=add',
+		       'key=mtype1',
+		       "value='piwav'",
+		       'mode=hl'
+		      );
+	}
+
+	# background filter
+	$new->addtype('back_evt1a', 1);
+	_run_command('punlearn', 'dmcopy');
+	_run_command('dmcopy',
+# pha=0:254 is obsolete as of ciao 4.2
+#		     $evt1a.'[EVENTS][pha=0:254,('.$lamcol.',pi)=region('.$pifilter.')]',
+		     $evt1a.'[EVENTS][('.$lamcol.',pi)=region('.$pifilter.')]',
+		     $new->back_evt1a,
+		     'opt=all',
+		     'clobber=yes',
+		    );
+	$evt1a = $new->back_evt1a;
+      } # grating == LETG
+
+    } # pifilter and HRC_S
+
+    # status filter
+    my $status =
+      $detnam == HRC_S ? 'xxxxxx00xxxx0xxx0000x000x00000xx' :
+      $detnam == HRC_I ? 'xxxxxx00xxxx0xxx0000x000x0000000' :
+	  die $detnam;
+
+    $new->addtype('flt1_evt1a', 1);
+    my $tfilter = $opts{tfilter} ? ", time=$tstart:$tstop" : '';
+    _run_command('punlearn', 'dmcopy');
+    _run_command('dmcopy',
+		 $evt1a."[EVENTS][status=$status$tfilter]",
+		 $new->flt1_evt1a,
+#		 'opt=all',
+		 'clobber=yes',
+		);
+
+    $evt1a = $new->flt1_evt1a;
+
+    # FIXME: this isn't really necessary
+    # GTI filter
+    $new->addtype('evt2', 2);
+    _run_command('punlearn', 'dmcopy');
+    _run_command('dmcopy',
+		 $evt1a.'[events][@'.$old->std_flt1.']' .
+		 ( $opts{allcols} ? '' : '[cols !crsu,!crsv,!amp_sf,!av1,!av2,!av3,!au1,!au2,!au3,!raw,!sumamps]' ),
+		 $new->evt2,
+#		 'opt=all',
+		 'clobber=yes',
+		);
+
+    # recompute deadtime statistics
+    # http://cxc.harvard.edu/ciao/threads/hrc_dtfstats/index.py.html
+    $new->addtype('dtfstats');
+    dtcor($old->dtf1, $new->dtfstats, $new->evt2);
+
+    # as of ciao 4.4, time filtering with opt=all does not correctly
+    # modify the GTI, so to work around, remove opt=all above and then
+    # reappend the region filter
+    if ($grating != NONE) {
+      _run_command('punlearn', 'dmappend');
+      _run_command('dmappend', $region_evt1a.'[region][subspace -time]', $new->evt2);
+    }
+
+    $evt2 = $new->evt2;
+
+    if ($opts{dtffilter}) {
+
+      $new->addtype('dtf1_gti');
+      _run_command(qw/ punlearn dmgti /);
+      _run_command('dmgti',
+		   $old->dtf1,
+		   $new->dtf1_gti,
+		   'userlimit=dtf>'.$opts{dtffilter},
+		   'clobber=yes',
+		   );
+
+      $new->addtype('evt2_dtffilt', 2);
+      _run_command('punlearn', 'dmcopy');
+      _run_command('dmcopy',
+		   $evt2.'[events][@'.$new->dtf1_gti.']',
+		   $new->evt2_dtffilt,
+		   'clobber=yes',
+		  );
+
+      $new->addtype('dtfstats_dtffilt');
+      dtcor($old->dtf1, $new->dtfstats_dtffilt, $new->evt2_dtffilt);
+
+      if ($grating != NONE) {
+	_run_command('punlearn', 'dmappend');
+	_run_command('dmappend', $region_evt1a.'[region][subspace -time]', $new->evt2_dtffilt);
+      }
+
+      $evt2 = $new->evt2_dtffilt;
+    }
+
+
+  }				# if _dolevel(2)
+
+  if (_dolevel(2.5)) {
+
+    if (!defined $evt2) {
+      $evt2 = $old->evt2;
+    }
+
+    if ($grating != NONE) {
+
+      my @order_list = map { -$_, $_ } @orders;
+      $new->addtype('pha2', 2);
+      if (1) {
+	_run_command('punlearn', 'tgextract');
+	_run_command('tgextract',
+		     'infile='.$evt2,
+		     'outfile='.$new->pha2,
+		     'tg_srcid_list=all',
+		     'tg_part_list=header_value',
+		     ( $detnam == HRC_S ? ('inregion_file=CALDB') : () ),
+		     'tg_order_list='.join(',',@order_list),
+		     'clobber=yes',
+		     'outfile_type=pha_typeII',
+		     'ancrfile=none',
+		     'respfile=none',
+		     (exists $opts{min_bin_leg} ? ( 'min_bin_leg='.$opts{min_bin_leg} ) : () ),
+		     (exists $opts{max_bin_leg} ? ( 'max_bin_leg='.$opts{max_bin_leg} ) : () ),
+		     (exists $opts{bin_size_leg} ? ( 'bin_size_leg='.$opts{bin_size_leg} ) : () ),
+		     (exists $opts{num_bins_leg} ? ( 'num_bins_leg='.$opts{num_bins_leg} ) : () ),
+		    );
+      }
+      else {
+	_run_command('punlearn', 'tgextract2');
+	_run_command('tgextract2',
+		     'infile='.$evt2,
+		     'outfile='.$new->pha2,
+		     'tg_srcid_list=all',
+		     'tg_part_list=header_value',
+		     ( $detnam == HRC_S ? ('region_file=CALDB') : () ),
+		     'tg_order_list='.join(',',@order_list),
+		     'clobber=yes',
+		     (exists $opts{min_bin_leg} ? ( 'min_bin_leg='.$opts{min_bin_leg} ) : () ),
+		     (exists $opts{max_bin_leg} ? ( 'max_bin_leg='.$opts{max_bin_leg} ) : () ),
+		     (exists $opts{bin_size_leg} ? ( 'bin_size_leg='.$opts{bin_size_leg} ) : () ),
+		     (exists $opts{num_bins_leg} ? ( 'num_bins_leg='.$opts{num_bins_leg} ) : () ),
+		    );
+      }
+
+      return 1 unless $opts{grmf}; # we can stop here
+
+      my $arm = 'LEG';
+      my $detsubsys =
+	$detnam == HRC_S ? 'HRC-S2' :
+	$detnam == HRC_I ? 'HRC-I' : die "unknown detname = $detnam";
+
+      _run_command('punlearn', 'ardlib');
+      for my $i (0..$#orders) {
+	my $order = $orders[$i];
+
+	my $rmffile; # save positive order rmf name for input to fullgarf
+
+	for my $order (-$order, $order) {
+
+	  if ($detnam == HRC_I or $opts{lsfparmfile} or $opts{lsfparmversion}) {
+	    my $lsfparmorder = $order > 0 ? 1 : -1;
+	    my $lsfparmfile;
+	    if ($opts{lsfparmfile}) {
+	      $lsfparmfile = $opts{lsfparmfile};
+	    }
+	    elsif ($opts{lsfparmversion}) {
+	      $lsfparmfile = $ENV{CALDB}."/data/chandra/hrc/lsfparm/hrcsleg${lsfparmorder}D1999-07-22lsfparm".$opts{lsfparmversion}.'.fits';
+	    }
+	    else {
+	      $lsfparmfile = $ENV{CALDB}."/data/chandra/hrc/lsfparm/hrcsleg${lsfparmorder}D1999-07-22lsfparmN0004.fits";
+	    }
+	    _run_command('pset', 'ardlib', 'AXAF_LETG_1111_LSF_FILE='.$lsfparmfile);
+	  }
+
+	  $rmffile = "$opts{outdir}/${arm}_$order.rmf";
+
+	  _run_command('punlearn', 'mkgrmf');
+	  _run_command('mkgrmf',
+		       "grating_arm=$arm",
+		       "order=$order",
+		       "outfile=$rmffile",
+		       'srcid=1',
+		       "detsubsys=$detsubsys",
+		       'threshold=1e-06',
+		       'obsfile='.$new->pha2.'[SPECTRUM]',
+		       'regionfile='.$new->pha2,
+		       'wvgrid_arf=compute',
+		       'wvgrid_chan=compute',
+		       'verbose=0',
+		       'clobber=yes',
+		      );
+	}
+
+	if ($opts{garf}) {
+
+	  if ($detnam == HRC_S or exists $opts{qefile}) {
+	    my $qefile = exists $opts{qefile} ? $opts{qefile} : hrcs_qefile($header);
+
+	    if (defined $qefile) {
+
+	      if ($detnam == HRC_S) {
+		for my $det (1..3) {
+		  _run_command('pset', 'ardlib',
+			       "AXAF_HRC-S${det}_QE_FILE=${qefile}[AXAF_QE${det}]");
+		}
+	      }
+	      elsif ($detnam == HRC_I) {
+		_run_command('pset', 'ardlib', "AXAF_HRC-I_QE_FILE=${qefile}");
+	      }
+	      else { die $detnam; }
+	    }
+
+	    my $qeufile = exists $opts{qeufile} ? $opts{qeufile} : hrcs_qeufile($header);
+	    if (defined $qeufile) {
+	      for my $det (1..3) {
+		_run_command('pset', 'ardlib',
+			     "AXAF_HRC-S${det}_QEU_FILE=${qeufile}[AXAF_QEU${det}]");
+	      }
+	    }
+
+	    if (exists $opts{badpix}) {
+	      if ($detnam == HRC_S) {
+		_run_command('pset', 'ardlib', "AXAF_HRC-S_BADPIX_FILE=${bpix1}[BADPIX]");
+	      }
+	      elsif ($detnam == HRC_I) {
+		_run_command('pset', 'ardlib', "AXAF_HRC-I_BADPIX_FILE=${bpix1}[BADPIX]");
+	      }
+	      }
+
+	  }
+
+	  _run_command('punlearn', 'mkgarf'); # fullgarf doesn't do this
+	  _run_command('punlearn', 'fullgarf');
+
+	  _run_command('/bin/sh', $fullgarf,
+		       $new->pha2,
+		       $_,	# pharow
+		       $evt2,
+		       $old->pcadasol1,
+		       'grid('.$rmffile.'[cols ENERG_LO,ENERG_HI])',
+		       #		     'grid('._rmffile('LEG', 'hrc', 1).'[cols ENERG_LO,ENERG_HI])',
+		       $old->dtf1,
+		       $bpix1,
+		       $opts{outdir}.'/'.substr($new->lbase(2),0,-1),
+		       'maskfile=NONE',
+		       # FIXME: need option here to clobber if wanted, but
+		       # this way the asphist files won't be regenerated for
+		       # each order arf created
+		       'clobber=yes',
+		      ) for ($i*2+1, $i*2+2);
+
+	  if ($orders == 1) {
+	    _run_command('echo', '# punlearn', 'add_grating_orders');
+	    _run_command('echo', '# add_grating_orders',
+			 $new->pha2,
+			 $order, $arm,
+			 $opts{outdir}.'/'.substr($new->lbase(2),0,-1)."${arm}_-${order}_garf.fits",
+			 $opts{outdir}.'/'.substr($new->lbase(2),0,-1)."${arm}_${order}_garf.fits",
+			 $opts{outdir}.'/'.substr($new->lbase(2),0,-1),
+			 'clobber=yes',
+			);
+	  }
+	} # if $opts{garf}
+      }
+
+    } # if $grating != NONE
+
+  }				# if _dolevel(2.5)
+
+  return 1;
+}
+
+sub _process_acis_directory {
+
+  my $grade_status_filter = sub {
+    my ($in, $out) = @_;
+    _run_command('punlearn', 'dmcopy');
+    _run_command('dmcopy',
+		 $in."[EVENTS][grade=0,2,3,4,6,status=0]",
+		 $out,
+		 'clobber=yes',
+		);
+  };
+
+  my $gti_filter = sub {
+    my ($in, $out, $flt1, $region_file) = @_;
+    _run_command('punlearn', 'dmcopy');
+    _run_command('dmcopy',
+		 $in.'[EVENTS][@'.$flt1.'][cols -phas]',
+		 $out,
+		 'clobber=yes',
+		);
+
+    if (defined $region_file) {
+      _run_command(qw/ punlearn dmappend /);
+      _run_command('dmappend',
+		   $region_file.'[region][subspace -time]',
+		   $out,
+		  );
+    }
+  };
+
+  my $destreak_filter = sub {
+    my ($in, $out) = @_;
+    _run_command('punlearn', 'destreak');
+    _run_command('destreak',
+		 'infile=' . $in,
+		 'outfile=' . $out,
+		 'mask=None',
+		 'filter=no',
+		 'clobber=yes',
+		);
+  };
+
+  my $orders = defined $opts{orders} ? $opts{orders} : 3;
+  my @orders = 1..$orders;
+
+  my $old = shift;
+
+  # all processing levels will need these
+  defined $old->file($_) or die "could not find $_ file"
+    for qw( flt1 pcadasol1 bpix1 pbk0 msk1 );
+
+  my @required;
+  if (_dolevel(1) or _dolevel(1.5)) {
+    @required = qw( evt1 bias0 stat1 );
+  }
+  elsif (_dolevel(2)) {
+    @required = qw( evt1a );
+  }
+
+  defined $old->file($_) or die "could not find $_ file"
+    for @required;
+
+  my $header = _header($old->evt1, 'events');
+  my $grating = _grating($header);
+  my $temp = _temp($header);
+
+  my ($cti_corr, $mtl1);
+  if ($temp == -120 and _dolevel(1)) {
+    $cti_corr = 1;
+    if (defined $old->mtl1) {
+      $mtl1 = $old->mtl1;
+    }
+    else {
+      warn "focal plane temperature is -120C but there is no mtl1 file so the CTI adjustment will be inaccurate\n";
+    }
+  }
+
+  -d $opts{outdir} or mkpath($opts{outdir}) or
+    die "could not create output directory $opts{outdir}: $!";
+
+  my $new = $old->copy;
+  $new->incproc;
+  $new->strip_gz;
+  $new->newdir($opts{outdir});
+
+  my $eventdef = acis_eventdef($header);
+  my $evt1;
+
+  my $bpix1 = $old->bpix1;
+
+  if (_dolevel(1)) {
+
+    my $tmpfile = File::Temp->new(DIR=>$opts{outdir}, SUFFIX=>'.fits',);
+    if ($old->evt1 =~ /\.gz$/i) {
+      _run_command("gzip -cd '".$old->evt1."' > $tmpfile");
+    }
+    else {
+      _run_command('cp', '-f', $old->evt1, $tmpfile);
+    }
+    _run_command('acis_clear_status_bits', $tmpfile);
+    $evt1 = $tmpfile;
+
+    if ($opts{destreak}) {
+      $new->addtype('dstrk_evt1', 1);
+      $destreak_filter->($evt1, $new->dstrk_evt1);
+      $evt1 = $new->dstrk_evt1;
+    }
+
+    # create new badpix file
+    if ($header->{READMODE} =~ /timed/i) {
+
+      # FIXME: need to clean this stuff up
+
+      my $obs = $opts{outdir} . '/acis_obs.par';
+      _run_command(qw/ punlearn dmmakepar /);
+      _run_command('dmmakepar', $evt1, $obs, 'clobber=yes');
+
+      _run_command(qw/ punlearn acis_build_badpix /);
+      _run_command('acis_build_badpix',
+		   'obsfile='.$obs,
+		   'pbkfile='.$old->pbk0,
+		   'biasfile='.$old->bias0,
+		   'outfile='.$opts{outdir}.'/acis_abb1_bpix1.fits',
+		   'bitflag=00000000000000020021100020022222',
+		   'calibfile=CALDB',
+		   'mode=h',
+		   'clobber=y',
+		   );
+
+      _run_command(qw/ punlearn acis_find_afterglow /);
+      _run_command('acis_find_afterglow',
+		   'infile='.$evt1,
+		   'outfile='.$opts{outdir}.'/acis_aglow_bpix1.fits',
+		   'badpixfile='.$opts{outdir}.'/acis_abb1_bpix1.fits',
+		   'maskfile='.$old->msk1,
+		   'statfile='.$old->stat1,
+		   'mode=h',
+		   'clobber=y',
+		   );
+
+      _run_command(qw/ punlearn acis_build_badpix /);
+      _run_command('acis_build_badpix',
+		   'obsfile='.$obs,
+		   'pbkfile='.$old->pbk0,
+		   'biasfile=None',
+		   'outfile='.$opts{outdir}.'/acis_repro_bpix1.fits',
+		   'calibfile='.$opts{outdir}.'/acis_aglow_bpix1.fits',
+		   'procbias=no',
+		   'mode=h',
+		   'clobber=y',
+		   );
+      $bpix1 = $opts{outdir}.'/acis_repro_bpix1.fits';
+    }
+
+#    my $gainfile = _acis_gainfile();
+    my $gainfile = exists $opts{gainfile} ? $opts{gainfile} : 'CALDB';
+    _run_command('punlearn', 'acis_process_events');
+    _run_command('acis_process_events',
+		 'infile='.$evt1,
+		 'outfile='.$new->evt1,
+		 'badpixfile='.$bpix1,
+		 'clobber=yes',
+		 (exists $opts{randpha} ?
+		  ($opts{randpha} ? 'rand_pha=yes' : 'rand_pha=no') : ()
+		  ),
+		 'acaofffile='.$old->pcadasol1,
+		 (exists $opts{randpix} ?
+		  ($opts{randpix} ? 'rand_pix_size=0.5' : 'rand_pix_size=0') : ()
+		 ),
+		 ($opts{geompar} ? ("geompar=$opts{geompar}") : () ),
+		 (($temp == -120 or $opts{gainfile}) ? ('gainfile='.$gainfile) : ()),
+		 ( $cti_corr ? ('apply_tgain=yes', 'apply_cti=yes',
+				($mtl1 ? ('mtlfile='.$mtl1) : ())) :
+		   ('apply_tgain=no', 'apply_cti=no')
+		 ),
+		 'eventdef=)'.$eventdef,
+		 #'check_vf_pha=yes',
+		 #'calc_cc_times=yes',
+		);
+
+    $evt1 = $new->evt1;
+
+  }
+
+  my $evt1a;
+  if (_dolevel(1.5) and $grating != NONE) {
+
+    $evt1 = $old->evt1 unless defined $evt1;
+
+    $new->addtype('src1a', 1);
+    my ($x, $y) = _xy_pos($old->evt1, $old->pcadasol1);
+    _run_command('punlearn', 'tgdetect');
+    _run_command('tgdetect',
+		 'infile='.$evt1,
+		 'outfile='.$new->src1a,
+		 'zo_pos_x='.sprintf("%.2f", $x),
+		 'zo_pos_y='.sprintf("%.2f", $y),
+		 'OBI_srclist_file=NONE',
+		 'clobber=yes',
+		);
+
+    $new->addtype('evt1_L1a');
+    _run_command('punlearn', 'tg_create_mask');
+    _run_command('tg_create_mask',
+		 'infile='.$evt1,
+		 'outfile='.$new->evt1_L1a,
+		 'input_pos_tab='.$new->src1a,
+		 'grating_obs=header_value',
+		 ($opts{geompar} ? ("geompar=$opts{geompar}") : () ),
+		 ((defined $opts{sA_zero_x} or defined $opts{sA_zero_y}) ? ('use_user_pars=yes') : () ),
+		 (defined $opts{sA_zero_x} ? ("sA_zero_x=$opts{sA_zero_x}") : () ),
+		 (defined $opts{sA_zero_y} ? ("sA_zero_y=$opts{sA_zero_y}") : () ),
+		 'clobber=yes',
+		);
+
+    $new->addtype('evt1a', 1);
+    _run_command('punlearn', 'tg_resolve_events');
+    _run_command('pset', 'tg_resolve_events', 'osort_lo.p_max=1.0') if $opts{osipugh};
+    _run_command('tg_resolve_events',
+		 'infile='.$evt1,
+		 'outfile='.$new->evt1a,
+		 'regionfile='.$new->evt1_L1a,
+		 'acaofffile='.$old->pcadasol1,
+		 'eventdef=)'.$eventdef.'_ACIS',
+		 ($opts{geompar} ? ("geompar=$opts{geompar}") : () ),
+		 'clobber=yes',
+		 ($opts{osipugh} ? ('osip=none', 'osort_lo='.$opts{osort_lo}, 'osort_hi='.$opts{osort_hi}) : ()),
+		);
+    $evt1a = $new->evt1a;
+  }
+
+  if (_dolevel(2)) {
+
+    if ($grating == NONE) {
+
+      $new->addtype('flt_evt1', 1);
+      $grade_status_filter->($evt1, $new->flt_evt1);
+
+      $new->addtype('evt2', 2);
+      $gti_filter->($new->flt_evt1, $new->evt2, $old->flt1);
+
+    }
+
+    else {
+
+    $evt1a = $old->evt1a unless defined $evt1a;
+
+    my $region_evt1a = $evt1a;
+
+    $new->addtype('flt1_evt1a', 1);
+    $grade_status_filter->($evt1a, $new->flt1_evt1a);
+    $evt1a = $new->flt1_evt1a;
+
+    $new->addtype('evt2', 2);
+    $gti_filter->($evt1a, $new->evt2, $old->flt1, $region_evt1a);
+
+    # add_grating_orders expects orders to be -3,-2,-1,+1,+2,+3
+    my @order_list = tg_m_seq($orders);
+    my @pharows = 1..@order_list;
+    $new->addtype('pha2', 2);
+    _run_command('punlearn', 'tgextract');
+    _run_command('tgextract',
+		 'infile='.$new->evt2,
+		 'outfile='.$new->pha2,
+		 'outfile_type=pha_typeII',
+		 'tg_srcid_list=all',
+		 'tg_part_list=header_value',
+		 'tg_order_list='.join(',',@order_list),
+		 'ancrfile=none',
+		 'respfile=none',
+		 'clobber=yes',
+		);
+
+    # if ($opts{destreak}) {
+
+    #   $new->addtype('dstrk_evt2', 2);
+    #   $destreak_filter->($new->evt2, $new->dstrk_evt2);
+
+    #   $new->addtype('dstrk_pha2', 2);
+    #   _run_command('punlearn', 'tgextract');
+    #   _run_command('tgextract',
+    # 		   'infile='.$new->dstrk_evt2,
+    # 		   'outfile='.$new->dstrk_pha2,
+    # 		   'outfile_type=pha_typeII',
+    # 		   'tg_srcid_list=all',
+    # 		   'tg_part_list=header_value',
+    # 		   'tg_order_list='.join(',',@order_list),
+    # 		   'ancrfile=none',
+    # 		   'respfile=none',
+    # 		   'clobber=yes',
+    # 		  );
+    # }
+
+    if ($opts{chips}) {
+      my $new_chips_tgscript = "$opts{outdir}/chips_tgscript_uxari.ch";
+      open CHIPSTGSCRIPT, $chips_tgscript
+	or die "could not open $chips_tgscript: $!";
+      open NEWCHIPSTGSCRIPT, "> $new_chips_tgscript"
+	or die "could not create $new_chips_tgscript: $!";
+      while (<CHIPSTGSCRIPT>) {
+	s/^f_evt="(.*)"$/'f_evt="'.$new->evt2.'"'/e and next;
+	s/^f_get="(.*)"$/f_get="$get_evt"/ and next;
+      } continue {
+	print NEWCHIPSTGSCRIPT $_ }
+	close CHIPSTGSCRIPT;
+      close NEWCHIPSTGSCRIPT;
+
+      _run_command('chips', '--batch', $new_chips_tgscript);
+    }
+
+
+    return 1 unless $opts{grmf}; # we can stop here
+
+      # No longer appear to need the OSIP file
+
+      # pha2 file may not exist if we're running with --noexec
+    #      my $osip = ($opts{exec} or -f $new->pha2) ?
+    #	_choose_osip($new->pha2) : 'CHOSEN_OSIP_INSERTED_HERE';
+
+    #      _run_command('pset', 'mkgarf', 'clobber=yes');
+    #      _run_command('pset', 'dmarfadd', 'clobber=yes');
+
+    my %parms = (
+		 HETG() => {
+			    'HEG' => {},
+			    'MEG' => {},
+			   },
+		 LETG() => {
+			    'LEG' => {},
+			   },
+		);
+
+    exists $parms{$grating} or die;
+
+    my $href = $parms{$grating};
+
+    for my $arm (keys %$href) {
+
+      # create the grating rmfs
+      for my $i (0..$#order_list) {
+
+	my $order = $order_list[$i];
+	my $pharow = $pharows[$i];
+
+	# add_grating_orders expect HEG first
+	$pharow += 2 * @orders if $arm eq 'MEG';
+
+	my $rmffile = "$opts{outdir}/${arm}_$order.rmf";
+
+	# FIXME
+	my $detsubsys = 'ACIS-S3';
+
+	_run_command('punlearn', 'mkgrmf');
+	_run_command('mkgrmf',
+		     "grating_arm=$arm",
+		     "order=$order",
+		     "outfile=$rmffile",
+		     'srcid=1',
+		     "detsubsys=$detsubsys",
+		     'threshold=1e-06',
+		     'obsfile='.$new->pha2.'[SPECTRUM]',
+		     'regionfile='.$new->pha2,
+		     'wvgrid_arf=compute',
+		     'wvgrid_chan=compute',
+		     'verbose=0',
+		     'clobber=yes',
+
+		    );
+
+	if ($opts{garf}) {
+	    _run_command('punlearn', 'mkgarf'); # fullgarf doesn't do this
+	    _run_command('punlearn', 'fullgarf');
+	    _run_command('/bin/sh', $fullgarf,
+		       $new->pha2,
+		       $pharow,
+		       $new->evt2,
+		       $old->pcadasol1,
+		       'grid('.$rmffile.'[cols ENERG_LO,ENERG_HI])',
+#		     'grid('._rmffile($arm, 'acis', 1).'[cols ENERG_LO,ENERG_HI])',
+		       ')evtfile',
+		       $bpix1,
+		       $opts{outdir}.'/'.substr($new->lbase(2),0,-1),
+		       'maskfile='.$old->msk1,
+		       'clobber=yes',
+		       );
+
+	}
+
+      }
+
+	# add_grating_orders expects only first through third orders
+      if ($orders == 3 and $opts{garf}) {
+	_run_command('echo', 'punlearn', 'add_grating_orders');
+	_run_command('echo', 'add_grating_orders',
+		     $new->pha2,
+		     $_, $arm,
+		     $opts{outdir}.'/'.substr($new->lbase(2),0,-1)."${arm}_-${_}_garf.fits",
+		     $opts{outdir}.'/'.substr($new->lbase(2),0,-1)."${arm}_${_}_garf.fits",
+		     $opts{outdir}.'/'.substr($new->lbase(2),0,-1),
+		     'clobber=yes',
+		    ) for @orders;
+      }
+
+    } # for each arm
+
+  } # else ... end of block which is run when $grating != NONE
+
+  } # if (_dolevel(2))
+
+  return 1;
+}
+
+{
+  my %osip;
+  sub _choose_osip {
+    my $file = shift;
+
+    my $h = _header($file);
+
+    exists $h->{'DATE-OBS'} and exists $h->{OBS_ID} or die;
+
+    # doesn't account for all possible formats
+    my ($year, $month, $day) = $h->{'DATE-OBS'} =~ /^(\d{4})-(\d{2})-(\d{2})T/
+      or die "$file, $h->{'DATE-OBS'}";
+
+    my $date_obs_jd = _ymd2jd($year, $month, $day);
+
+    if (! %osip) {
+      my $osip_dir = "$ENV{CALDB}/data/chandra/acis/osip";
+      opendir OSIP, $osip_dir or die;
+      my @files = grep /^acisD\d+\-\d+\-\d+osipN\d+\.fits/, readdir OSIP;
+      closedir OSIP;
+      @files = grep /N0006/, @files if _temp() == -120; # special case
+
+      for (@files) {
+	my ($y, $m, $d) = /^acisD(\d+)\-(\d+)\-(\d+)/;
+	my $jd = _ymd2jd($y, $m, $d);
+
+	# choose between, say, N004 and N005
+	if (exists $osip{$jd}) {
+	  my ($n1) = $osip{$jd} =~ /N(\d+)/;
+	  my ($n2) = $_ =~ /N(\d+)/;
+	  $osip{$jd} = $osip_dir.'/'.$_ if $n2 > $n1;
+	}
+	else {
+	  $osip{$jd} = $osip_dir . '/' . $_;
+	}
+      }
+    }
+
+    # special case
+    if ($h->{OBS_ID} >= 1790 and $h->{OBS_ID} <= 1794) {
+      return $osip{_ymd2jd(2000,8,12)}
+    }
+
+    else {
+      my @sorted_dates = sort { $a <=> $b } keys %osip;
+      if ($sorted_dates[0] > $date_obs_jd) {
+	warn("could not find OSIP earlier than obs-date, using closest\n");
+	return $osip{$sorted_dates[0]};
+      }
+      else {
+	# use latest date of osips which are older than our observations
+	return $osip{(grep($_ < $date_obs_jd, @sorted_dates))[-1]};
+#	return $osip{(sort { $b <=> $a } grep($date_obs_jd>=$_,keys %osip))[0]};
+      }
+    }
+  }
+}
+
+sub _run_command {
+  my ($cmd, @args) = @_;
+  print STDERR join(' ', $cmd, map ( "'$_'", @args)),"\n\n";
+  if ($opts{'exec'}) {
+    system($cmd, @args);
+    die unless ($opts{errignore} or $? == 0);
+  }
+}
+
+# forks a dmlist process that prints header, reads from the child
+# go to all this trouble to avoid problems with the shell misinterpretting the
+# filename
+sub _header {
+  my ($file, $extname) = @_;
+
+  my %h;
+
+  my $pid = open(DMLIST, '-|');
+  defined $pid or die "could not fork: $!";
+
+  if (!$pid) {
+    $file .= "[$extname]" if $extname;
+    exec 'dmlist', $file, 'keys';
+    die "could not exec dmlist: $!";
+  }
+
+  local $_;
+  while (<DMLIST>) {
+    chomp;
+    /^\d+/ or next;		# skip initial dmlist output
+    my (undef, $key, $rest) = split ' ', $_, 3;
+
+    # can't seem to come up with a foolproof regex
+    my ($value) = $rest =~ /(.*?)\s*(?:(?:String|Real|Int|Logical)[48]?) {6}/ or
+      die "file=$file, linenumber=$., line='$_'";
+
+    # strip units
+    $value =~ s/\s+\[\w+\]$//;
+
+    $h{$key} = $value;
+  }
+  close DMLIST or die "dmlist returned $?";
+  wait;
+
+  return \%h;
+}
+
+sub _dmlist_cols {
+  my ($file, @cols) = @_;
+
+  my @out = map( [], @cols );
+
+  my $pid = open(DMLIST, '-|');
+  defined $pid or die "could not fork: $!";
+
+  if (!$pid) {
+    $file .= '[cols ' . join(', ', @cols) . ']';
+    exec 'dmlist', $file, 'data,clean';
+    die "could not exec dmlist: $!";
+  }
+
+  local $_;
+  while (<DMLIST>) {
+    chomp;
+    /^#/ and next;
+    my @vals = split;
+    @vals == @out or
+      die 'found '.(scalar @vals) . ' values, but '.(scalar @out). ' were needed';
+    for my $i (0..$#vals) {
+      push @{$out[$i]}, $vals[$i];
+    }
+
+  }
+  close DMLIST or die "dmlist returned $?";
+  wait;
+
+  return @out;
+}
+
+{
+  my $temp;
+  sub _temp {
+    @_ or return $temp;
+    my $h = shift;
+    if ($opts{temp}) {
+      $opts{temp} == -120 or $opts{temp} == -110 or
+	die "temperature option '$opts{temp}' is invalid\n";
+      return $temp = $opts{temp};
+    }
+
+    if (!exists $h->{FP_TEMP}) {
+      warn "No temperature keyword found, using -120 (--temp option to override)\n";
+      return $temp = -120;
+    }
+
+    my $fudge = 6;
+    if (abs($h->{FP_TEMP} - 153) < $fudge) {
+      return $temp = -120;
+    } elsif (abs($h->{FP_TEMP} - 163) < $fudge) {
+      return $temp = -110;
+    } else {
+      die "temperature = ".$h->{FP_TEMP}." cannot be dealt with\n";
+    }
+  }
+}
+
+sub _needs_ampsfcor {
+  my $h = shift;
+  return if exists $h->{AMPSFCOR} and $h->{AMPSFCOR} =~ /true/i;
+  return 1;
+}
+
+sub _width_threshold {
+  my $h = shift;
+
+  # doesn't account for all possible formats
+  my ($year, $month, $day) = $h->{'DATE-OBS'} =~ /^(\d{4})-(\d{2})-(\d{2})T/
+    or die;
+
+=begin comment
+
+  DATE-OBS           width threshold
+
+  before 2000-10-5   3
+
+  after 2000-10-5    2
+
+=cut
+
+  return 3
+    if _ymd2jd($year, $month, $day) < _ymd2jd(2000, 10, 5);
+
+  return 2;
+
+}
+
+sub _needs_rangelev {
+  my $h = shift;
+
+  return ('', $h->{RANGELEV}) if exists $h->{RANGELEV};
+
+  # doesn't account for all possible formats
+  my ($year, $month, $day) = $h->{'DATE-OBS'} =~ /^(\d{4})-(\d{2})-(\d{2})T/
+    or die;
+
+=begin comment
+
+  DATE-OBS           Detector          RANGELEV value
+
+  before 1999-12-6   HRC-I & HRC-S     90
+
+  after 1999-12-6    HRC-I             115
+
+  after 1999-12-6    HRC-S             125
+
+=cut
+
+  return (1,90)
+    if _ymd2jd($year, $month, $day) < _ymd2jd(1999, 12, 6);
+
+  for (_detnam($h)) {
+    $_ == HRC_I and return (1, 115);
+    $_ == HRC_S and return (1, 125);
+    die;
+  }
+}
+
+sub _grating {
+
+  my $h = shift;
+
+  if ($opts{grating}) {
+    $opts{grating} =~ /^[hln]$/i or
+      die "grating '$opts{grating}' is invalid\n";
+
+    for (lc($opts{grating})) {
+      /h/ and return HETG;
+      /l/ and return LETG;
+      /n/ and return NONE;
+      die;
+    }
+  }
+
+  else {
+    exists $h->{GRATING} or die
+      "GRATING keyword not found\n";
+
+    $h->{GRATING} =~ /^[lhn]/i or
+      die "grating $h->{GRATING} is unrecognized\n";
+
+    for (lc($h->{GRATING})) {
+      /h/ and return HETG;
+      /l/ and return LETG;
+      /n/ and return NONE;
+      die;
+    }
+
+  }
+}
+
+sub _detnam {
+  my $h = shift;
+
+  exists $h->{DETNAM} or die
+    "DETNAM keyword not found\n";
+
+  for ($h->{DETNAM}) {
+    /ACIS-/ and return ACIS;
+    $_ eq 'HRC-I' and return HRC_I;
+    $_ eq 'HRC-S' and return HRC_S;
+    die $h->{DETNAM};
+  }
+
+}
+
+sub _help {
+  exec("$Config{installbin}/perldoc", '-F', $FindBin::Bin . '/' . $FindBin::RealScript);
+  die "could not exec $Config{installbin}/perldoc: $!";
+}
+
+sub _version {
+  print $version,"\n";
+  exit 0;
+}
+
+sub _xy_pos {
+  my ($file, $pcadasol1) = (shift, shift);
+  my $h = _header($file, 'events');
+  my $ra = exists $h->{RA_TARG} ? $h->{RA_TARG} :
+    exists $h->{RA_NOM} ? $h->{RA_NOM} :
+      die "could not find RA coord in $file";
+  my $dec = exists $h->{DEC_TARG} ? $h->{DEC_TARG} :
+    exists $h->{DEC_NOM} ? $h->{DEC_NOM} :
+      die "could not find DEC coord in $file";
+
+  _run_command('punlearn', 'dmcoords');
+  system('punlearn', 'dmcoords');
+  my ($cmd, @args) = ('dmcoords', $file, $pcadasol1, 'option=cel', 'celfmt=deg',
+		      'ra='.sprintf("%.4f",$ra), 'dec='.sprintf("%.4f", $dec),
+		     'verbose=1' );
+  print STDERR join(' ', $cmd, map ( "'$_'", @args)),"\n\n";
+
+#  open(DMCOORDS, '-|') or exec($cmd, @args) or die "could not run dmcoords: $!";
+
+  defined(my $pid = open(DMCOORDS, '-|')) or die "could not fork: $!";
+  if ($pid) {
+    while (<DMCOORDS>) {
+      if (/SKY\(X,Y\):\s+(\S+)\s+(\S+)/) {
+	close(DMCOORDS);
+	return $1, $2;
+      }
+    }
+    die 'could not determine sky coords';
+  }
+  else {
+    exec($cmd, @args);
+    die "could not exec dmcoords: $!";
+  }
+}
+
+# taken from my Astro module
+sub _ymd2jd {
+  my ($year, $month, $day) = @_;
+  my ($a, $b, $c, $d) = (0,0,0,0);
+  if ( $month == 1 or $month == 2 ) { $year--; $month += 12 }
+
+  $a=int($year/100);
+  $b=2-$a+int($a/4);
+  $c=int(365.25*$year);
+  $d=int(30.6001*($month+1));
+  return ($b+$c+$d+$day+1720994.5);
+}
+
+{
+  my %filters;
+  sub _hrcs_letg_filter {
+    my $type = lc shift;
+
+    exists $filters{$type} and return $filters{$type};
+
+    my %types = (
+		 pi => '_tgmap',
+		 light => '075',
+		 medium => '062',
+		 heavy => '046',
+		 );
+
+    exists $types{$type} or return $opts{pifilter};
+    #exists $types{$type} or die "HRC-S/LETG filter type '$type' is invalid";
+
+    my $dir = "$ENV{CALDB}/data/chandra/hrc/tgpimask2";
+    opendir FDIR, $dir or die "could not opendir '$dir': $!";
+    my @f = readdir FDIR;
+    closedir FDIR;
+
+    @f = grep /^letgD\d{4}-\d{2}-\d{2}pireg\Q$types{$type}\E_N\d+\.fits(?:\.gz)?$/, @f or
+      die "could not find any valid filter files in '$dir'";
+
+    # again, we rely on alphabetical sort to get the latest file
+    return ($filters{$type} = $dir . '/' . (sort { $b cmp $a } @f)[0]);
+  }
+}
+
+sub ciao_version {
+
+  open VERSION, "< $ENV{ASCDS_INSTALL}/VERSION" or return '';
+  my $version = <VERSION>;
+  close VERSION;
+
+  ($version) = $version =~ /^CIAO\s+(\d+\.\d+\S*)/ or return '';
+
+  return $version;
+}
+
+# see http://cxc.harvard.edu/ciao/threads/reprocessed/index.html#caldb
+sub caldb_version {
+  exists $ENV{CALDB} or die "environment variable CALDB is not set";
+
+  my $f = $ENV{CALDB} . '/docs/chandra/caldb_version/caldb_version.fits';
+  -r $f or die "could not read $f";
+
+  defined(my $pid = open(CHILD, '-|')) or die "could not fork: $!";
+  if ($pid) {
+    chomp(my @rows = <CHILD>);
+    close CHILD;
+    return +(split ' ', $rows[-1])[-1];
+  }
+  else {
+    exec 'dmlist', $f.'[cols caldb_ver]', 'data';
+    die "could not exec dmlist: $!";
+  }
+}
+
+# run dmkeypar
+sub hdu_key {
+  my ($f, $k) = @_;
+
+  defined(my $pid = open(CHILD, '-|')) or die "could not fork: $!";
+  if ($pid) {
+    chomp(my $out = <CHILD>);
+    close CHILD;
+    return $out;
+  }
+  else {
+    exec 'dmkeypar', $f, $k, 'echo+';
+    die "could not exec dmkeypar: $!";
+  }
+}
+
+sub acis_eventdef {
+  my $header = shift;
+  my $eventdef;
+
+  READMODE :
+      for ($header->{READMODE}) {
+	if ($_ eq 'TIMED') {
+	  for ($header->{DATAMODE}) {
+	    /FAINT/ and $eventdef = 'stdlev1', last READMODE;
+	    /GRADED/ and $eventdef = 'grdlev1', last READMODE;
+	  }
+	} elsif ($_ eq 'CONTINUOUS') {
+	  for ($header->{DATAMODE}) {
+	    /FAINT/ and $eventdef = 'cclev1', last READMODE;
+	    /GRADED/ and $eventdef = 'ccgrdlev1', last READMODE;
+	  }
+	}
+	die "cannot handle READMODE='$header->{READMODE}', DATAMODE='$header->{DATAMODE}'";
+      }
+
+  return $eventdef;
+}
+
+sub tg_m_seq {
+  my $orders = shift;
+  my @o = 1..$orders;
+
+  return ( map(-$_, @o), @o ) if $opts{tgmseq} == 0;
+  return map( (-$_, $_), @o ) if $opts{tgmseq} == 1;
+  die "invalid --tgmseq=$opts{tgmseq}";
+}
+
+{
+  my $pdir;
+
+  sub pdir_temp {
+
+    return $pdir if $pdir;
+
+    my $key;
+    for my $k (qw/ PDIR PFILES UPARM /) {
+      exists $ENV{$k} and $key=$k, last;
+    }
+
+    my (undef, $sys) = split ';', $ENV{$key}, 2;
+    $sys or die "$key=$ENV{$key}";
+
+    $pdir = File::Temp->newdir();
+    $ENV{$key} = $pdir . ';' . $sys;
+
+    return $pdir;
+  }
+
+}
+
+
+sub dtcor {
+
+  my ($dtf, $dtfstats, $evt2) = @_;
+
+  _run_command('punlearn', 'hrc_dtfstats');
+  _run_command('hrc_dtfstats',
+	       'infile=' . $dtf,
+	       'outfile=' . $dtfstats,
+	       'gtifile=' . $evt2 . '[gti]',
+	       'clobber=yes',
+	      );
+
+  my $dummy_hdr = { ONTIME => 0 };
+
+  my $hdr = $opts{exec}  ? _header($evt2, 'events') : $dummy_hdr;
+  my $dtcor = $opts{exec} ? (_dmlist_cols($dtfstats, 'dtcor'))[0]->[0] : 0;
+  my $ontime = $hdr->{ONTIME};
+  my $livetime = $dtcor * $ontime;
+
+  my %upd = (
+	     LIVETIME =>  $livetime,
+	     EXPOSURE => $livetime,
+	     DTCOR => $dtcor,
+	    );
+  while (my ($k, $v) = each %upd) {
+    _run_command('punlearn', 'dmhedit');
+    _run_command('dmhedit',
+		 $evt2,
+		 'filelist=',
+		 'op=add',
+		 'key=' . $k,
+		 'value=' . $v,
+		);
+
+  }
+}
+
+sub hrcs_gainfile {
+  my $header = shift;
+  my $obsid = $header->{OBS_ID};
+  my $dateobs = $header->{'DATE-OBS'};
+  my $f;
+  if ( $obsid == 14238 ) {
+    $f = $ENV{CALDB} . '/data/chandra/hrc/t_gmap/hrcsD2012-03-29t_gmapN0002.fits';
+  }
+  elsif (
+	 $obsid == 14324 or
+	 $obsid == 14396 or
+	 $obsid == 14397
+	) {
+    $f = $ENV{CALDB} . '/data/chandra/hrc/t_gmap/hrcsD1999-07-22t_gmapN0002.fits';
+  }
+  die $f if defined $f and ! -f $f;
+  return $f;
+}
+
+sub hrcs_qefile {
+  my $header = shift;
+  my $obsid = $header->{OBS_ID};
+  my $dateobs = $header->{'DATE-OBS'};
+  my $f;
+  my $dir = $ENV{CALDB} . '/data/chandra/hrc/qe';
+  my $v = $opts{qeversion} ? $opts{qeversion} : 'N0014';
+
+  if ($obsid == 14238) {
+    $f = $dir . '/hrcsD2012-03-29qe'.$v.'.fits';
+  }
+  elsif (
+	 $obsid == 14324 or
+	 $obsid == 14396 or
+	 $obsid == 14397
+	) {
+    $f = $dir . '/hrcsD1999-07-22qe'.$v.'.fits';
+  }
+  elsif ($dateobs ge '2012-03-29') {
+    $f = $dir . '/hrcsD2012-03-29qe'.$v.'.fits';
+  }
+  else {
+    $f = $dir . '/hrcsD1999-07-22qe'.$v.'.fits';
+  }
+
+  die $f if defined $f and ! -f $f;
+  return $f;
+}
+
+sub hrcs_qeufile {
+  my $header = shift;
+  my $obsid = $header->{OBS_ID};
+  my $dateobs = $header->{'DATE-OBS'};
+  my $year = substr($dateobs,0,4);
+
+  my $f;
+  my $dir = $ENV{CALDB} . '/data/chandra/hrc/qeu';
+  my $v = $opts{qeuversion} ? $opts{qeuversion} : 'N0008';
+
+
+  if ($obsid == 14238) {
+    $f = $dir . '/hrcsD2012-03-29qeu'.$v.'.fits';
+  }
+  elsif (
+	 $obsid == 14324 or
+	 $obsid == 14396 or
+	 $obsid == 14397
+	) {
+    $f = $dir . '/hrcsD2012-01-01qeu'.$v.'.fits';
+  }
+  elsif ($year eq '2012') {
+    if ($dateobs ge '2012-03-29') {
+      $f = $dir . '/hrcsD2012-03-29qeu'.$v.'.fits';
+    }
+    else {
+      $f = $dir . '/hrcsD2012-01-01qeu'.$v.'.fits';
+    }
+  }
+  else {
+    $f = $dir . '/hrcsD' . $year . '-01-01qeu'.$v.'.fits';
+  }
+
+
+  die $f if defined $f and ! -f $f;
+  return $f;
+}
+
+package CXCFiles;
+use strict;
+use vars qw( @ISA );
+use File::Basename qw( basename );
+require AutoLoader;
+@ISA = qw( AutoLoader );
+
+sub AUTOLOAD {
+  no strict;
+
+  my $me = shift;
+
+  my $name;
+  ($name = $AUTOLOAD) =~ s/.*:://;
+
+  my $files = $me->file($name);
+  defined $files or die "file type '$name' not found";
+#  defined $files or goto &AutoLoader::AUTOLOAD;
+
+  return !ref $files ? $files : wantarray ? @$files : $files;
+}
+
+sub DESTROY { }
+
+sub new {
+  my $class = ref $_[0] ? ref shift : shift;
+  my $dir = @_ ? shift : '.';
+  my ($f, $n, $detbase) = _file_hash($dir);
+  my $me = {
+	   dir => $dir,
+	   files => $f,
+	   n => $n,
+	   det => { base => $detbase },
+	  };
+  my %dettypes = ( acisf => main::ACIS(), acism => main::ACIS(), hrcf => main::HRC() );
+  die "$detbase unhandled" unless exists $dettypes{$detbase};
+  $me->{det}{type} = $dettypes{$detbase};
+
+  bless $me, $class;
+
+  # determine if we want to gz new filenames
+  my $ngz = my $nfiles = 0;
+  for my $type ($me->types) {
+    for my $file ($me->file($_)) {
+      $nfiles++;
+      $ngz++ if $file =~ /\.gz$/;
+    }
+  }
+  $me->{gz} = $nfiles ? $ngz/$nfiles >= 0.5 : 0;
+
+  return $me;
+}
+
+sub dir {
+  return $_[0]->{dir};
+}
+
+sub copy {
+  my $me = shift;
+  bless $me->_deep_copy, ref $me;
+}
+
+sub _deep_copy {
+  my $me = shift;
+  return !ref($me) ? $me :
+    UNIVERSAL::isa($me,'ARRAY') ? [map _deep_copy($_), @$me] :
+	UNIVERSAL::isa($me, 'HASH') ? { map { $_ => _deep_copy($me->{$_}) } keys %$me} :
+	    die "could not copy a $me";
+}
+
+# modifies filenames so they point to a different directory
+sub newdir {
+  my $me = shift;
+  my $newbase = shift;
+
+  for my $type (keys %{$me->{files}}) {
+    if ( defined $me->{files}{$type} ) {
+      if (!ref $me->{files}{$type}) {
+	$me->{files}{$type} = $newbase . '/' . basename($me->{files}{$type});
+      }
+      else {
+	$_ = $newbase . '/' . basename($_) for @{$me->{files}{$type}};
+      }
+    }
+  }
+  $me->{dir} = $newbase;
+}
+
+sub strip_gz {
+  my $me = shift;
+
+  for my $type ( keys %{$me->{files}} ) {
+    if ( defined $me->{files}{$type} ) {
+      if ( !ref $me->{files}{$type} ) {
+	$me->{files}{$type} =~ s/\.(?:gz|bz2)\z//i;
+      }
+      else {
+	s/\.(?:gz|bz2)\z//i for @{$me->{files}{$type}};
+      }
+    }
+  }
+}
+
+# retrieves processing number
+sub proc_num {
+  my $me = shift;
+  return $me->{n};
+}
+
+# retrieves a file of a given type
+sub file {
+  my $me = shift;
+  my $type = shift;
+  return unless exists $me->{files}{$type};
+  return $me->{files}{$type} unless ref $me->{files}{$type};
+
+  return wantarray ? @{$me->{files}{$type}} : [@{$me->{files}{$type}}];
+}
+
+# returns a list of all types found
+sub types {
+  my $me = shift;
+  return keys %{$me->{files}};
+}
+
+# increments the processing number on all files
+sub incproc {
+  my $me = shift;
+
+  my $old_n = $me->proc_num;
+  my $new_n = sprintf '%.'.length($old_n).'d', $old_n+1;
+
+  for my $type (keys %{$me->{files}}) {
+    if ( defined $me->{files}{$type} ) {
+      if (!ref $me->{files}{$type} ) {
+	$me->{files}{$type} =~ s/N\Q$old_n\E/N$new_n/;
+      }
+      else {
+	s/N\Q$old_n\E/N$new_n/ for @{$me->{files}{$type}};
+      }
+    }
+  }
+
+  $me->{n} = $new_n;
+}
+
+sub addtype {
+  my $me = shift;
+  my $type = shift;
+  my $l = @_ ? shift : 1;
+  my $ext = @_ ? shift : 'fits';
+
+  return $me->{files}{$type} if exists $me->{files}{$type};
+
+  $me->{files}{$type} = $me->dir . '/' . $me->lbase($l) . $type . '.' . $ext;
+  return $me->file($type);
+}
+
+sub dettype {
+  my $me = shift;
+  return $me->{det}{type};
+}
+
+sub detbase {
+  my $me = shift;
+  return $me->{det}{base};
+}
+
+# retrieves the basename part for a given processing level
+sub lbase {
+  my $me = shift;
+  my $l = shift;
+  return $me->{lbase}{$l} if exists $me->{lbase}{$l};
+
+  $l == 1 or $l == 2 or die "levels 1 and 2 recognized only";
+  my $detbase = $me->detbase();
+  my $n = $me->proc_num;
+  my $re;
+  for ($l) {
+    $_ == 1 and $re = qr/(\Q$detbase\E\d+_\d+N\Q$n\E_)/, last;
+    $_ == 2 and $re = qr/(\Q$detbase\E\d+N\Q$n\E_)/, last;
+    die;
+  }
+
+  my @types2try = grep {
+    $_ ne 'pcadasol1' &&
+    $_ ne 'bias0' &&
+    $_ ne 'pbk0' &&
+    1 } $me->types;
+  for my $type (@types2try) {
+    $me->file($type) =~ /$re/ and return($me->{lbase}{$l} = $1);
+  }
+
+  # didn't match, but we try to make it up for L2
+  if ($l==2) {
+    ($me->{lbase}{$l} = $me->lbase(1)) =~ s/_\d+(N\d+)/$1/;
+    return $me->{lbase}{$l};
+  }
+  die;
+
+}
+
+sub _file_hash {
+  my $dir = shift;
+
+  opendir DIR, $dir or die "could not open directory '$dir' ($!), dead";
+
+  my $match = qr/^(?:pcad[fm]|acis[fm]|hrcf)\d+(?:_\d+)?N\d+_\w+\.fits(?:\.gz|\.bz2)?$/;
+  my @files = grep { /$match/ and -f "$dir/$_"} readdir DIR;
+  closedir DIR;
+
+  # look for files in ChaSeR subdirs
+  for my $d (qw( primary secondary secondary/aspect )) {
+    if (-d "$dir/$d") {
+      opendir DIR, "$dir/$d" or die "could not open directory '$dir/$d' ($!), dead";
+      push @files, map "$d/$_", grep { /$match/ and -f "$dir/$d/$_" } readdir DIR;
+      closedir DIR;
+    }
+  }
+
+  # some files (e.g., pcad list) need to be in sorted order for later use
+  @files = sort { $a cmp $b } @files;
+
+  my ($l1_base) = (sort { ($a =~ /N(\d+)/)[0] <=> ($b =~ /N(\d+)/)[0] } grep /_evt1\.fits/, @files)[0] =~ /((acis[fm]|hrcf).*N\d+)/ or
+    die "no processed files found, dead";
+  my $detbase = $2;
+  (my $base_match = $l1_base) =~ s/_\d+N\d+.*//; # will match only acisf|hrcf, etc
+  my ($proc_num)= $l1_base =~ /N(\d+)/;
+
+  # put directory name back
+  $_ = "$dir/$_" for @files;
+
+  # fill in %files
+  my $submatch = qr/\Q$base_match\E(?:_\d+)?\QN$proc_num\E_(\w+)\.fits/;
+  my %files = map { /$submatch/ ? ($1 => $_) : () } @files;
+
+  # bias0 files
+  my $bias0_match =  qr/acis[fm]\d+N\d+_\d_bias0\.fits/;
+  $files{bias0} = join(',', grep(/$bias0_match/, @files));
+
+  # FIXME: only use the last one?
+  #
+  # pbk0 files
+  my $pbk0_match =  qr/acis[fm]\d+N\d+_pbk0\.fits/;
+#  $files{pbk0} = join(',', grep(/$pbk0_match/, @files));
+  $files{pbk0} = (grep(/$pbk0_match/, @files))[-1];
+
+  # can be multiple dtf1 files...
+  my $dtf1_match =  qr/hrcf\d+_\d+N\d+_dtf1\.fits/;
+  $files{dtf1} = (grep(/$dtf1_match/, @files))[-1];
+
+  # ...and similarly for bpix1
+  my $bpix1_match =  qr/\d+_\d+N\d+_bpix1\.fits/;
+  $files{bpix1} = (grep(/$bpix1_match/, @files))[-1];
+
+  # pcad files
+  my $pcad_match =  qr/pcad[fm]\d+N\d+_asol1\.fits/;
+
+  # getting multiple versions with the same time stamp, e.g.,
+  # both pcadf082063623N00[34]_asol1.fits.gz
+
+  my @all_pcad_files = grep(/$pcad_match/, @files);
+  my @times = map { /pcadf_?(\d{9})/ } @all_pcad_files;
+  my %times; @times{@times} = ();
+  my @pcad_files = ();
+  for my $time (sort keys %times) {
+    push @pcad_files, (grep /\Q$time\E/, @all_pcad_files)[-1];
+  }
+
+  # FIXME: something has seriously changed in the way pcad files are named!!!
+  @pcad_files = grep(/pcad[fm]\d+.*_asol1.fits/, @files);
+
+=begin comment
+
+$ ls /data/legs/rpete/flight/xcal_hrcsi/data/hz43/1514/primary/*asol1*
+3/1514/primary/pcadf065958580N004_asol1.fits
+
+$ ls /data/legs/rpete/data/ARLac/22793/primary/*asol1*
+pcadf699677457N001_asol1.fits.gz
+
+$ ls /data/legs/rpete/data/ARLac/22772/primary/*asol1*
+pcadf22772_000N001_asol1.fits.gz
+
+=cut
+
+  $files{pcadasol1} = join(',', @pcad_files);
+
+  # FIXME, getting things like
+#'biasfile=./secondary/acisf243490881N002_0_bias0.fits.gz,./secondary/acisf243490881N002_1_bias0.fits.gz,./secondary/acisf243490881N002_2_bias0.fits.gz,./secondary/acisf243490881N002_3_bias0.fits.gz,./secondary/acisf243490881N002_4_bias0.fits.gz,./secondary/acisf243490881N002_5_bias0.fits.gz,./secondary/acisf243490881N003_0_bias0.fits.gz,./secondary/acisf243490881N003_1_bias0.fits.gz,./secondary/acisf243490881N003_2_bias0.fits.gz,./secondary/acisf243490881N003_3_bias0.fits.gz,./secondary/acisf243490881N003_4_bias0.fits.gz,./secondary/acisf243490881N003_5_bias0.fits.gz'
+
+  # some of the above code can result in an undef value, remove such cases
+  defined $files{$_} or delete $files{$_} for keys %files;
+
+  return \%files, $proc_num, $detbase;
+}
+
+package DSVersion;
+use strict;
+use overload
+  '<' => 'lt',
+  '<=' => 'le',
+  '>' => 'gt',
+  '>=' => 'ge',
+  '==' => 'eq',
+  nomethod => sub { die "illegal operator $_[3]" };
+
+sub new {
+  my $class = ref $_[0] ? ref shift : shift;
+  my $string = shift;
+
+  my $me;
+
+  if ($string =~ /^(\d+)\.(\d+)\.(\d+)$/) {
+    $me->{MAJOR} = $1;
+    $me->{MINOR} = $2;
+    $me->{MINORMINOR} = $3;
+  }
+  elsif ($string =~ /^R.*/) { # for versions like R4CU5UPD14, just use 5.0.0
+    return DSVersion->new('5.0.0');
+  }
+  else {
+    die "do not understand DS version string '$string'";
+  }
+
+  bless $me, $class;
+}
+
+sub major {
+  return $_[0]->{MAJOR};
+}
+
+sub minor {
+  return $_[0]->{MINOR};
+}
+
+sub minorminor {
+  return $_[0]->{MINORMINOR};
+}
+
+sub gt {
+  my ($l, $r) = @_;
+  if (!UNIVERSAL::isa($r, ref $l)) {
+    return $l > DSVersion->new($r);
+  }
+  else {
+    return(
+	   ($l->major > $r->major) ||
+	   ($l->major == $r->major && $l->minor > $r->minor) ||
+	   ($l->major == $r->major && $l->minor == $r->minor && $l->minorminor > $r->minorminor)
+	   );
+
+  }
+}
+
+sub eq {
+  my ($l, $r) = @_;
+  if (!UNIVERSAL::isa($r, ref $l)) {
+    return $l == DSVersion->new($r);
+  }
+  else {
+    return $l->major == $r->major && $l->minor == $r->minor && $l->minorminor == $r->minorminor;
+  }
+}
+
+sub lt {
+  my ($l, $r) = @_;
+  return ( !($l==$r) && !($l>$r) );
+}
+
+sub ge {
+  my ($l, $r) = @_;
+  return ( ($l==$r) || ($l>$r) );
+}
+
+sub le {
+  my ($l, $r) = @_;
+  return ( ($l==$r) || ($l<$r) );
+}
+

@@ -1,0 +1,696 @@
+#! /usr/bin/perl -w
+use strict;
+
+use Config;
+use lib '/home/rpete/local/perlmods';
+use lib '/home/rpete/local/perlmods/'.$Config{archname};
+
+use PDL;
+use CFITSIO;
+use Getopt::Long;
+use Carp;
+
+$| = 1;
+
+my $VERSION = '0.2';
+
+#
+# prototypes
+#
+sub _copy_hdu($$$$);
+sub _filter_pha($$$$);
+sub _read_pha_filter($);
+sub _open_input_file($);
+sub _open_output_file($);
+sub _get_hdu_nums($$);
+
+my %default_opts = (
+		    filter => '/data/legs/rpete/flight/filters/more_conservative.fits',
+		    nrows => 10000,
+		    extname => 'events',
+		    status => 1,
+		    chip => 0,
+		    );
+my %opts = %default_opts;
+
+GetOptions(\%opts,
+	   'help!', 'filter=s', 'nrows', 'extname=s', 'version!', 'status!', 'chip!',
+	   ) or die "Try \`$0 --help\' for more information.\n";
+$opts{help} and help();
+$opts{version} and _version();
+
+#
+# remaining arguments are input and output files
+#
+@ARGV == 2 or
+    die "$0: invalid arguments\nTry \`$0 --help\' for more information.\n";
+my ($infile,$outfile) = (shift, shift);
+
+#
+# read filter columns, convert to pha cut limit "images"
+#
+print STDERR "Using filter file $opts{filter}\n";
+my ($u,$v,$pha_low,$pha_high) = _read_pha_filter($opts{filter});
+defined $u or
+    croak("error reading PHA filter file '$opts{filter}'");
+my ($cut_image_low,$cut_image_high) = _mk_cut_images($u,$v,$pha_low,$pha_high);
+
+#
+# open input and output event list files
+#
+my $status = 0;
+print STDERR "Opening events file '$infile'...";
+my $infptr = _open_input_file($infile) or
+    croak("error opening input event file '$infile'");
+print STDERR "done\n";
+my $outfptr = _open_output_file($outfile) or
+    $infptr->close_file($status),
+    croak("error opening output event file '$outfile'");
+
+my ($nhdus,$targethdu) = _get_hdu_nums($infptr,$opts{extname}) or
+    $infptr->close_file($status),
+    $outfptr->delete_file($status=0),
+    croak("error getting HDU number for '$opts{extname}' extension in input event file '$infile'");
+
+#
+# create some common keywords that will be overwritten in the output headers
+#
+my $DATE;
+CFITSIO::fits_get_system_time($DATE,undef,$status);
+my $CREATOR = $0; $CREATOR =~ s/(.*\/)//;
+
+#
+# copy all HDUs before the event list
+#
+for (my $i=1; $i<$targethdu; $i++) {
+    _copy_hdu($infptr,$outfptr,$i,0) or
+	$infptr->close_file($status),
+	$outfptr->delete_file($status=0),
+	croak("error copying HDU number $i from input event file '$infile' to output event file '$outfile'");
+}
+
+#
+# filter events
+#
+
+$infptr->movabs_hdu($targethdu,undef,$status);
+_filter_pha($infptr,$outfptr,$cut_image_low,$cut_image_high) or
+    $infptr->close_file($status),
+    $outfptr->delete_file($status=0),
+    croak("error filtering on PHA input event file '$infile' to output event file '$outfile'");
+
+#
+# copy all HDUs after the event list
+#
+for (my $i=$targethdu+1; $i<=$nhdus; $i++) {
+    _copy_hdu($infptr,$outfptr,$i,0) or
+	$infptr->close_file($status),
+	$outfptr->delete_file($status=0),
+	croak("error copying HDU number $i from input event file '$infile' to output event file '$outfile'");
+}
+
+$infptr->close_file($status);
+$outfptr->close_file($status);
+
+exit 0;
+
+sub _filter_pha($$$$) {
+    my ($infptr,$outfptr,$cut_image_low,$cut_image_high) = @_;
+
+    my $status = 0;
+
+    my $hdr = $infptr->read_header();
+
+    my (@ttype, @tform, @tunit, @tlmin, @tlmax,
+	@tcnam, @tctyp, @tcrvl, @tcrpx, @tcdlt,
+	%cols);
+    exists $hdr->{TFIELDS} or return;
+    my $j = 0;
+    for (my $i=1; $i<=$hdr->{TFIELDS}; $i++) {
+
+	# skip status flags if requested
+	next if ($hdr->{'TTYPE'.$i} =~ /status/ and ! $opts{status});
+
+	my ($ttype,$tform) = ($hdr->{'TTYPE'.$i}, $hdr->{'TFORM'.$i});
+	my $tunit = exists $hdr->{'TUNIT'.$i} ? $hdr->{'TUNIT'.$i} : '' ;
+	my $tlmin = exists $hdr->{'TLMIN'.$i} ? $hdr->{'TLMIN'.$i} : undef ;
+	my $tlmax = exists $hdr->{'TLMAX'.$i} ? $hdr->{'TLMAX'.$i} : undef ;
+
+	my $tcnam = exists $hdr->{'TCNAM'.$i} ? $hdr->{'TCNAM'.$i} : undef ;
+	my $tctyp = exists $hdr->{'TCTYP'.$i} ? $hdr->{'TCTYP'.$i} : undef ;
+	my $tcrvl = exists $hdr->{'TCRVL'.$i} ? $hdr->{'TCRVL'.$i} : undef ;
+	my $tcrpx = exists $hdr->{'TCRPX'.$i} ? $hdr->{'TCRPX'.$i} : undef ;
+	my $tcdlt = exists $hdr->{'TCDLT'.$i} ? $hdr->{'TCDLT'.$i} : undef ;
+	foreach ($ttype,$tform,$tunit,$tlmin,$tlmax) {
+	    s/^'(.*?)\s*?'/$1/ if defined;
+	}
+	push @ttype, $ttype;
+	push @tform, $tform;
+	push @tunit, $tunit;
+	push @tlmin, $tlmin;
+	push @tlmax, $tlmax;
+
+	push @tcnam, $tcnam;
+	push @tctyp, $tctyp;
+	push @tcrvl, $tcrvl;
+	push @tcrpx, $tcrpx;
+	push @tcdlt, $tcdlt;
+
+	$j++;
+	$cols{lc($ttype)} = { tform => $tform, incolnum => $i, outcolnum => $j };
+    }
+
+=for comment
+
+    # work-around a bug in cfitsio, for the moment, in which writing a bit-type
+    # column first in a binary table produces nastiness
+    grep($_ !~ /X/, @tform) or die;
+    while ($tform[0] =~ /X/) {
+	$cols{$_}{outcolnum}-- for (keys %cols); # decrement output column numbers
+	$cols{lc($ttype[0])}{outcolnum} = @ttype;# make this one the last
+	push @$_, (shift @$_)                    # modify all arrays
+	    for (\@ttype, \@tform, \@tunit, \@tlmin, \@tlmax,
+		 \@tcnam, \@tctyp, \@tcrvl, \@tcrpx, \@tcdlt);
+    }
+
+=cut
+
+    $outfptr->insert_btbl(0,scalar(@ttype),\@ttype,\@tform,\@tunit,$opts{extname},0,$status);
+    _check_status($status) or return;
+
+    # copy a bunch of keywords the hard way
+    my @copy_keywords = qw( HDUNAME CONTENT HDUCLASS HDUCLAS1 HDUCLAS2 ORIGIN CREATOR REVISION
+			    ASCDSVER CHECKSUM DATASUM DATE DATE-OBS DATE-END TIMESYS
+			    MJDREF TIMEZERO TIMEUNIT BTIMNULL BTIMRATE BTIMDRFT BTIMCORR
+			    TIMEREF TASSIGN CLOCKAPP TIERRELA TIERABSO TIMVERSN TSTART TSTOP
+			    TIMEPIXR TIMEDEL MISSION TELESCOP INSTRUME DETNAM OBS_ID DATAMODE
+			    EQUINOX RADECSYS DATACLAS TLM_FMT GRATING OBJECT TITLE OBSERVER
+			    OBI_NUM SEQ_NUM SIM_X SIM_Y SIM_Z DEFOCUS FOC_LEN OBS_MODE
+			    RA_NOM DEC_NOM ROLL_NOM ROLL_PNT ACSYS1 ACSYS2 ACSYS3 ACSYS4 ACSYS5
+			    MIR_AL_X MIR_AL_Y MIR_AL_Z STG_AL_X STG_AL_Y STG_AL_Z ASPTYPE
+			    MTYPE1 MFORM1 MTYPE2 MFORM2 MTYPE3 MFORM3 MTYPE4 MFORM4
+			    MTYPE5 MFORM5 MTYPE6 MFORM6 MTYPE7 MFORM7 MTYPE8 MFORM8
+			    ONTIME DSTYP1 DSVAL1 DSFORM1 DSREF1
+			    DTCOR LIVETIME EXPOSURE DTYPE1 DFORM1
+			    );
+    for (my $i=0; $i<=$hdr->{TFIELDS}; $i++) {
+	push @copy_keywords, map($_.$i, qw( TCNAM TCTYP TCRVL TCRPX TCDLT ) );
+    }
+
+    foreach my $key (@copy_keywords) {
+	exists $hdr->{$key} or next;
+	my $comment = exists $hdr->{COMMENTS}{$key} ? $hdr->{COMMENTS}{$key} : undef;
+	my $value = $hdr->{$key};
+	if ($value =~ /^'(.*?)'$/) {
+	    $outfptr->write_key_str($key,$1,$comment,$status);
+	}
+	elsif ($value =~ /^\d+$/) {
+	    $outfptr->write_key_lng($key,$value,$comment,$status);
+	}
+	elsif ($value =~ /^[TF]$/) {
+	    $outfptr->write_key_log($key,($value eq 'T'),$comment,$status);
+	}
+	elsif ($value =~ /\./) {
+	    $outfptr->write_key_dbl($key,$value,13,$comment,$status);
+	}
+	else {
+	    carp("error copying key '$key', value '$value'");
+	}
+    }
+
+    # retain old HISTORY keywords, add some of our own
+    #$outfptr->write_key_lng('HISTNUM',@{$hdr->{COMMENTS}{HISTORY}}+1,undef,$status);
+    if (@{$hdr->{COMMENTS}{HISTORY}}) {
+	foreach (@{$hdr->{COMMENTS}{HISTORY}}) {
+	    $outfptr->write_history(substr($_,1),$status);
+	}
+    }
+    $outfptr->write_history("TOOL :$CREATOR   $DATE",$status);
+
+    _check_status($status) or return;
+
+    if (!$opts{chip}) {
+	exists $cols{rawx} and exists $cols{rawy} or
+	    warn("could not read RAW columns, trying CHIP\n"),
+	    $opts{chip} = 1;
+    }
+    if ($opts{chip}) {
+	exists $cols{chipx} and exists $cols{chipy} and exists $cols{chip_id} or
+	    carp("could not read CHIP columns"),
+	    return;
+    }
+
+    exists $cols{pha} or
+	carp("could not read PHA column"),
+	return;
+
+    my $nrows;
+    $infptr->get_num_rows($nrows,$status);
+
+    $opts{nrows} = $nrows if ($opts{nrows} < 1 or $opts{nrows} > $nrows);
+
+    #
+    # set up piddles
+    #
+    my %datatypes = (
+		     'A' => { 'pdl' => undef, 'cfitsio' => CFITSIO::TSTRING(), },
+		     'I' => { 'pdl' => short, },
+		     'J' => { 'pdl' => long, },
+		     'E' => { 'pdl' => float, },
+		     'D' => { 'pdl' => double, },
+		     'X' => { 'pdl' => byte, 'cfitsio' => CFITSIO::TBIT(), },
+		     );
+    foreach my $dt (keys %datatypes) {
+	next if exists $datatypes{$dt}{'cfitsio'};
+	$datatypes{$dt}{'cfitsio'} = _match_datatype($datatypes{$dt}{'pdl'});
+	if ($datatypes{$dt}{'cfitsio'} == -1) {
+	    carp("no matching CFITSIO datatype found for TFORM '$dt'");
+	    return;
+	}
+    }
+    for (@ttype) {
+	my $ttype = lc $_;
+	$cols{$ttype}{tform} =~ /^(\d+)([A-Z])$/ or
+	    carp("unrecognized TFORM = '$cols{$ttype}{tform}'"),
+	    return;
+	my ($repeat, $type) = ($1, $2);
+	$cols{$ttype}{repeat} = $1;
+	exists $datatypes{$type} or
+	    carp("unrecognized TFORM = '$cols{$ttype}{tform}'"),
+	    return;
+	if ($type eq 'A') {
+	    $cols{$ttype}{'pdl'} = [];
+	}
+	else {
+	    $cols{$ttype}{'pdl'} = $repeat > 1 ?
+		zeroes($datatypes{$type}{'pdl'}, $repeat, $opts{nrows}) : 
+		zeroes($datatypes{$type}{'pdl'}, $opts{nrows})
+
+	}
+	$cols{$ttype}{cfitsio_datatype} = $datatypes{$type}{'cfitsio'};
+    }
+
+    print STDERR "Filtering events...    ";
+
+    my $good_mask = zeroes(byte,$opts{nrows});
+
+    my $old_packing = CFITSIO::PerlyUnpacking(-1);
+  CFITSIO::PerlyUnpacking(0);
+    my $rows_at_a_time = $opts{nrows} > $nrows ? $nrows : $opts{nrows};
+    my $rows_done = 0;
+    my $rows_written = 0;
+    my ($cut_image_nx, $cut_image_ny) = $cut_image_low->dims;
+
+    while ($rows_done < $nrows) {
+
+	print STDERR (("\b"x4).sprintf(" %2d",int(100*$rows_done/$nrows)).'%');
+	my $i;
+
+	$good_mask .= 0;
+
+	my $rows_this_time = $rows_at_a_time;
+	$rows_this_time = $nrows-$rows_done if ($rows_this_time > $nrows-$rows_done);
+
+	#
+	# read raw/chip[xy] first
+	#
+	my @pre_read = $opts{chip} ? qw( pha chipx chipy chip_id ) : qw( pha rawx rawy );
+	for (@pre_read) {
+	    $infptr->read_col($cols{$_}{cfitsio_datatype},
+			      $cols{$_}{incolnum},
+			      $rows_done+1, 1,
+			      $cols{$_}{repeat}*$rows_this_time, 0,
+			      ${$cols{$_}{'pdl'}->get_dataref},undef,$status
+			      );
+	    $cols{$_}{'pdl'}->upd_data;
+	}
+
+	# same data, different names
+	my $pha = $cols{pha}{'pdl'};
+        my ($rawx, $rawy) = $opts{chip} ?
+	    _chip2raw($cols{chipx}{'pdl'}, $cols{chipy}{'pdl'}, $cols{chip_id}{'pdl'}) :
+	    ($cols{rawx}{'pdl'}, $cols{rawy}{'pdl'});
+
+	my $x_index = ($rawy/128)->short;
+	my $y_index = ($rawx/128)->short;
+
+	my $index1 = which(
+	    $x_index >= 0 & $x_index <= $cut_image_nx-1 &
+	    $y_index >= 0 & $y_index <= $cut_image_ny-1
+	    );
+
+	my $index2 = which(
+	    $cut_image_low->index2d($x_index->index($index1),$y_index->index($index1)) <=
+	    $pha->index($index1) &
+	    $cut_image_high->index2d($x_index->index($index1),$y_index->index($index1)) >=
+	    $pha->index($index1)
+	    );
+
+	(my $tmp = $good_mask->index($index1)->index($index2)) .= 1;
+
+
+	# make sure invalid rows are not used if last time through loop
+	if ($nrows <= $rows_this_time+$rows_done && $pha->nelem > $rows_this_time) {
+	    (my $tmp=$good_mask->slice($rows_this_time.':-1')) .= 0;
+	}
+	
+	my $good_index = which($good_mask);
+	$good_index->nelem or
+	    $rows_done += $rows_this_time,
+	    next;
+
+	for (@ttype) {
+	    my $ttype = lc $_;
+
+	    #
+	    # read if necessary
+	    #
+	    if (! grep($ttype eq $_,  @pre_read))
+	    {
+		if ($cols{$ttype}{cfitsio_datatype} == CFITSIO::TSTRING()) {
+		    $infptr->read_col($cols{$ttype}{cfitsio_datatype},
+				      $cols{$ttype}{incolnum},
+				      $rows_done+1, 1,
+				      $rows_this_time, '',
+				      $cols{$ttype}{'pdl'}, undef, 
+				      $status);
+		}
+		else {
+		    $infptr->read_col($cols{$ttype}{cfitsio_datatype},
+				      $cols{$ttype}{incolnum},
+				      $rows_done+1, 1,
+				      $cols{$ttype}{repeat}*$rows_this_time, 0,
+				      ${$cols{$ttype}{'pdl'}->get_dataref},
+				      undef,$status);
+		    $cols{$ttype}{'pdl'}->upd_data;
+		}
+	    }
+	    _check_status($status) or
+		carp("error reading from input event list"),
+		return;
+
+	   #
+	   # write rows
+	   #
+	   if ($cols{$ttype}{cfitsio_datatype} == CFITSIO::TSTRING()) {
+		$outfptr->write_col($cols{$ttype}{cfitsio_datatype},
+				    $cols{$ttype}{outcolnum},
+				    $rows_written+1, 1,
+				    $good_index->nelem,[@{$cols{$ttype}{'pdl'}}[$good_index->list]],
+				    $status);
+	    }
+	    else {
+		my $index = $good_index;
+		if ($cols{$ttype}{repeat} > 1) {
+		    $index = ($good_index->dummy(0,$cols{$ttype}{repeat})*$cols{$ttype}{repeat} + sequence($cols{$ttype}{repeat}))->clump(-1);
+		}
+		$outfptr->write_col($cols{$ttype}{cfitsio_datatype},
+				    $cols{$ttype}{outcolnum},
+				    $rows_written+1, 1,
+				    $cols{$ttype}{repeat}*$good_index->nelem,
+				    $cols{$ttype}{'pdl'}->clump(-1)->index($index)->get_dataref,
+				    $status);
+	    }
+	    _check_status($status) or
+		carp("error writing to output event list"),
+		return;
+
+	}
+        $rows_written += $good_index->nelem;
+	$rows_done += $rows_this_time;
+    }
+
+    print STDERR (("\b"x4).'100%');
+
+    print STDERR " done - ";
+    print STDERR "kept $rows_written/$nrows (".(sprintf "%.1f",100*$rows_written/$nrows)."%) events\n";
+	
+    $outfptr->update_key(CFITSIO::TSTRING(),'CREATOR',$CREATOR,undef,$status);
+    $outfptr->update_key(CFITSIO::TSTRING(),'DATE',$DATE,undef,$status);
+    $outfptr->update_chksum($status);
+
+    CFITSIO::PerlyUnpacking($old_packing);
+
+    return 1;
+}
+
+# Returns number of HDUs in file, as well as HDU number of the
+# given extension=$target_hdunam.
+sub _get_hdu_nums($$) {
+    my ($fptr,$target_hdunam) = @_;
+
+    my $status = 0;
+    my $current_hdunum = $fptr->get_hdu_num(undef);
+
+    my $numhdus;
+    $fptr->get_num_hdus($numhdus,$status);
+
+    $fptr->movnam_hdu(CFITSIO::ANY_HDU(),$target_hdunam,0,$status);
+    my $target_hdunum = $fptr->get_hdu_num(undef);
+
+    $fptr->movabs_hdu($current_hdunum,undef,$status);
+
+    _check_status($status) or return;
+
+    return($numhdus,$target_hdunum);
+}
+
+# Copies HDU number $hdunum from $infptr to $outfptr.
+# $return_to_old_hdu is a boolean flag indicating whether
+# $infptr should be repositioned to it's pre-called HDU
+# number prior to returning.
+sub _copy_hdu($$$$) {
+    my ($infptr,$outfptr,$hdunum,$return_to_old_hdu) = @_;
+
+    my $status = 0;
+
+    my $old_hdu_num = $infptr->get_hdu_num(undef);
+    $infptr->movabs_hdu($hdunum,undef,$status);
+    $infptr->copy_hdu($outfptr,0,$status);
+    $outfptr->update_key(CFITSIO::TSTRING(),'CREATOR',$CREATOR,undef,$status);
+    $outfptr->update_key(CFITSIO::TSTRING(),'DATE',$DATE,undef,$status);
+    $outfptr->update_chksum($status);
+    $infptr->movabs_hdu($old_hdu_num) if $return_to_old_hdu;
+    _check_status($status) or return;
+
+    return 1;
+}
+
+sub _open_input_file($) {
+    my $file = shift;
+    my $status = 0;
+    my $fptr = CFITSIO::open_file($file,CFITSIO::READONLY(),$status);
+    _check_status($status) or return;
+    return $fptr;
+}
+
+sub _open_output_file($) {
+    my $file = shift;
+    my $status = 0;
+    substr($file,0,1) eq '!' or $file = '!'.$file;
+    my $fptr = CFITSIO::create_file($file,$status);
+    _check_status($status) or return;
+    return $fptr;
+}
+
+# Read table of regions and pha limits.
+sub _read_pha_filter($) {
+    my $file = shift;
+
+    my $status = 0;
+
+    my $fptr = CFITSIO::open_file($file,CFITSIO::READONLY(),$status);
+
+    _check_status($status) or 
+	return;
+
+    $fptr->movnam_hdu(CFITSIO::ANY_HDU(),'phalim',0,$status);
+
+    _check_status($status) or 
+	$fptr->close_file($status=0),
+	return;
+
+    my $nrows;
+    $fptr->get_num_rows($nrows,$status);
+
+    my $u = zeroes(short,$nrows);
+    my $v = zeroes(short,$nrows);
+    my $pha_low = zeroes(short,$nrows);
+    my $pha_high = zeroes(short,$nrows);
+
+    my ($u_colnum, $v_colnum, $pha_low_colnum, $pha_high_colnum);
+    
+    $fptr->get_colnum(0,'lab_u',$u_colnum,$status);
+    $fptr->get_colnum(0,'lab_v',$v_colnum,$status);
+    $fptr->get_colnum(0,'pha_low',$pha_low_colnum,$status);
+    $fptr->get_colnum(0,'pha_high',$pha_high_colnum,$status);
+
+    _check_status($status) or 
+	$fptr->close_file($status=0),
+	return;
+
+    my $old_unpacking = CFITSIO::PerlyUnpacking(-1);
+    CFITSIO::PerlyUnpacking(0);
+    $fptr->read_col(_match_datatype($u),$u_colnum,1,1,$nrows,0,${$u->get_dataref},undef,$status);
+    $fptr->read_col(_match_datatype($v),$v_colnum,1,1,$nrows,0,${$v->get_dataref},undef,$status);
+    $fptr->read_col(_match_datatype($pha_low),$pha_low_colnum,1,1,$nrows,0,${$pha_low->get_dataref},undef,$status);
+    $fptr->read_col(_match_datatype($pha_high),$pha_high_colnum,1,1,$nrows,0,${$pha_high->get_dataref},undef,$status);
+    CFITSIO::PerlyUnpacking($old_unpacking);
+
+    _check_status($status) or 
+	$fptr->close_file($status=0),
+	return;
+
+    $u->upd_data;
+    $v->upd_data;
+    $pha_low->upd_data;
+    $pha_high->upd_data;
+
+    return ($u, $v, $pha_low, $pha_high);
+}
+
+# make an image of the pha limits
+sub _mk_cut_images {
+    my ($u,$v,$pha_low,$pha_high) = @_;
+
+    my $image_low = zeroes(short,$v->max,$u->max) - 1;
+    my $image_high = $image_low->copy;
+
+    my $tmp;
+    ($tmp = $image_low->index2d($v-1,$u-1)) .= $pha_low;
+    ($tmp = $image_high->index2d($v-1,$u-1)) .= $pha_high;
+
+    return ($image_low,$image_high);
+}
+    
+    
+# Check CFITSIO status.
+sub _check_status($) {
+    my $status = shift;
+    if ($status != 0) {
+	my $txt;
+      CFITSIO::fits_get_errstatus($status,$txt);
+	print STDERR "CFITSIO error detected: $txt\n";
+	return 0;
+    }
+
+    return 1;
+}
+
+sub _version {
+    print "$0, version $VERSION\n";
+    exit 0;
+}
+
+sub help {
+
+    print <<EOP;
+Usage: $0 [options] infile outfile
+
+  Options:
+  --help        This message.
+  --version     Print version information.
+  --filter      PHA filter file, default is $default_opts{filter}.
+  --extname     Name of extension containing events, default is '$default_opts{extname}'.
+  --nrows       Number of events to process at a time, default is $default_opts{nrows}.
+  --nostatus    Do not copy status column. This gives a marginal speedup, but is not
+                recommended.
+  --chip        Use CHIP coordinates instead of RAW.
+
+  BUGS:
+
+    * Only a predetermined number of other keywords from the event list header
+      are copied. In other words, keyword copying is not dynamic, and needs to
+      be. Currently there is no planned fix for this problem. If you notice a
+      keyword missing in the output file, please notify the author (if you want
+      it fixed, anyway).
+
+  AUTHOR:
+    Pete Ratzlaff <pratzlaff\@cfa.harvard.edu>
+
+EOP
+
+    exit 0;
+}
+
+#
+# find appropriate CFITSIO datatype for a given piddle type.
+# Can be passed the piddle itself or a PDL::Type token (e.g.,
+# float() with no args).
+#
+sub _match_datatype {
+    my $arg = shift;
+
+    my $invalid_cfitsio_type = -1;
+
+    my $pdl_type;
+    if (UNIVERSAL::isa($arg,'PDL')) {
+	$pdl_type = $arg->get_datatype;
+    }
+    else {
+	$pdl_type = $arg->[0];
+    }
+
+    my $pdl_size = PDL::Core::howbig($pdl_type);
+
+    my @cfitsio_possible_types;
+    # test for real datatypes
+    if ($pdl_type == float(1)->get_datatype or
+	$pdl_type == double(1)->get_datatype
+	)
+    {
+	@cfitsio_possible_types = (
+				 CFITSIO::TDOUBLE(),
+				 CFITSIO::TFLOAT(),
+				   );
+    }
+    elsif ($pdl_type == short(1)->get_datatype or
+	   $pdl_type == long(1)->get_datatype
+	   )
+    {
+	@cfitsio_possible_types = (
+				 CFITSIO::TSHORT(),
+				 CFITSIO::TINT(),
+				 CFITSIO::TLONG(),
+				   );
+    }
+    elsif ($pdl_type == ushort(1)->get_datatype or
+	   $pdl_type == byte(1)->get_datatype
+	   )
+    {
+	@cfitsio_possible_types = (
+				 CFITSIO::TBYTE(),
+				 CFITSIO::TUSHORT(),
+				 CFITSIO::TUINT(),
+				 CFITSIO::TULONG(),
+				   );
+    }
+
+
+    foreach my $cfitsio_type (@cfitsio_possible_types) {
+	return $cfitsio_type if $pdl_size == CFITSIO::sizeof_datatype($cfitsio_type);
+    }
+    return $invalid_cfitsio_type;
+}
+
+sub _chip2raw {
+	my ($chipx,$chipy,$id) = @_;
+
+	# this copies the data
+	$chipx = $chipx->long;
+	$chipy = $chipy->long;
+
+	my ($tmp, $index);
+
+	$index = which($id == 1);
+	($tmp = $chipy->index($index)) -= 12;
+
+	$index = which($id == 2);
+	($tmp = $chipy->index($index)) += 16460;
+
+	$index = which($id == 3);
+	($tmp = $chipy->index($index)) += 32930;
+
+	return ($chipx, $chipy);
+}
+

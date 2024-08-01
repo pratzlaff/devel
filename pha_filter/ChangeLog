@@ -1,0 +1,11 @@
+2001-06-21  Pete Ratzlaff  <pratzlaff@cfa.harvard.edu>
+
+	* Removed the work-around mentioned below.
+
+2000-08-23  Pete Ratzlaff  <pratzlaff@cfa.harvard.edu>
+
+	* Reworked read/write of filtered table, mostly regarding bit-type
+	columns. Includes work-around of a bug in cfitsio in which writing
+	a bit column as first in the table produces sigsegv. Fixed this by
+	moving any front bit columns to the end.
+

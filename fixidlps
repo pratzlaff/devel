@@ -1,0 +1,26 @@
+#! /bin/sh
+
+f="$1"
+
+if test $# != 1
+then
+	echo "
+
+Usage: $0 file.ps
+
+  Rotates file.ps inplace, fixing the IDL 'seascape' orientation.
+  Running multiple times on the same file will cycle through the
+  four different orientations.
+
+"
+	exit 1
+fi
+
+if test ! -w "$f"
+then
+  echo "$f" is unwriteable
+  exit
+fi
+
+gs -dBATCH -dNOPAUSE "-sOutputFile=$f.tmp" -sDEVICE=ps2write "-dAutoRotatePages=/None" -c "<< /Orientation 1 >> setpagedevice" 0 rotate 0 0 translate -f "$f" \
+&& mv "$f.tmp" "$f"

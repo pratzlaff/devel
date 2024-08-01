@@ -1,0 +1,504 @@
+#! /usr/bin/perl -w
+use strict;
+
+my $version = '0.1';
+
+use Config;
+use lib '/home/rpete/local/perlmods';
+use lib '/home/rpete/local/perlmods/'.$Config{archname};
+
+use Cwd;
+use CFITSIO;
+use Astro;
+use FindBin;
+
+use constant LETG => 1;
+use constant HETG => 2;
+use constant ACIS => 3;
+use constant HRC => 4;
+
+use Getopt::Long;
+my %default_opts = (
+		    'exec' => 1,
+		    afterglow => 1,
+		    );
+my %opts = %default_opts;
+
+die "you should run tg_reprocess instead of this stuffy old script\n";
+
+GetOptions(\%opts,
+	   'help!', 'version!', 'exec!', 'grating=s', 'afterglow!', 'temp=i',
+	   ) or die "Try `$0 --help' for more information.\n";
+$opts{help} and _help();
+$opts{version} and _version();
+
+@ARGV or die "invalid arguments\nTry `$0 --help' for more information\n";
+
+$ENV{CALDB} or die "CALDB not set, CIAO environment needed\n";
+
+# standard CIAO files
+my $gainfile = "$ENV{CALDB}/data/chandra/acis/bcf/gain/acisD2000-08-12gainN0002.fits";
+my $hegrmf = "$ENV{CALDB}/data/chandra/tel/grating/hetg/cpf/rmf/acisheg1D1999-07-22rmfN0004.fits";
+my $megrmf = "$ENV{CALDB}/data/chandra/tel/grating/hetg/cpf/rmf/acismeg1D1999-07-22rmfN0004.fits";
+my $legrmf = "$ENV{CALDB}/data/chandra/tel/grating/letg/cpf/rmf/acisleg1D1999-07-22rmfN0001.fits";
+my $osip_dir = "$ENV{CALDB}/data/chandra/acis/cpf/osip";
+
+# external scripts
+my $add_orders =     "$FindBin::Bin/add_grating_orders";
+my $chips_tgscript = "$FindBin::Bin/chips_tgscript.ch";
+my $mkgarf =         "$FindBin::Bin/mkgarf_acis";
+
+for ($gainfile, $hegrmf, $megrmf, $legrmf, $chips_tgscript, $mkgarf, $add_orders, $osip_dir) {
+  -e $_ or die "$_ not found";
+}
+
+_process_directory($_) for @ARGV;
+
+exit 0;
+
+sub _process_directory {
+  my $old_dir = cwd;
+
+  my $dir = shift;
+  chdir $dir or die "could not chdir($dir)";
+
+  my %f = _make_file_hash('.');
+
+  # need evt1, evt2, bpix1, aoff1, flt1
+  for (qw( evt1 evt2 bpix1 aoff1 flt1 pcad_files )) {
+    $f{$_} or die "could not find $_ file";
+  }
+
+  my ($evt1, $flt1, $evt2, $aoff1, $bpix1, $pcad_files) =
+    @f{qw( evt1 flt1 evt2 aoff1 bpix1 pcad_files )};
+
+  my $header = _header($f{flt1}, 'filter');
+  my $grating = _grating($header);
+  my $temp = _temp($header);
+
+  my $new_l2_base = _inc_proc($f{l2_base}) or die "no L2 base?";
+
+  my $new_evt1 = _inc_proc(_basename($evt1));
+  _run_command('punlearn', 'acis_process_events');
+  _run_command('acis_process_events',
+	       'infile='.$evt1,
+	       'outfile='.$new_evt1,
+	       'eventdef=)stdlev1',
+	       'doevtgrade=no',
+	       'stop=none',
+	       'clobber=yes',
+	       ($temp == -120 ? ('gainfile='.$gainfile) : ()),
+	       );
+
+  (my $new_src1a = $new_evt1) =~ s/evt1/src1a/;
+  _run_command('punlearn', 'tgdetect');
+  _run_command('tgdetect',
+	       'infile='.$new_evt1,
+	       'outfile='.$new_src1a,
+	       'OBI_srclist_file=NONE',
+	       'clobber=yes',
+	       );
+
+  (my $new_evt1L1a = $new_evt1) =~ s/evt1/evt1_L1a/;
+  _run_command('punlearn', 'tg_create_mask');
+  _run_command('tg_create_mask',
+	       'infile='.$new_evt1,
+	       'outfile='.$new_evt1L1a,
+	       'input_pos_tab='.$new_src1a,
+	       'grating_obs=header_value',
+	       'clobber=yes',
+	       );
+
+  my $pcad_list = 'pcad_asol1.lis';
+  open PCADLIST,  '> '.$pcad_list
+    or die "could not create $pcad_list: $!";
+  print PCADLIST join("\n", @$pcad_files),"\n";
+  close PCADLIST;
+
+  (my $new_evt1a = $new_evt1) =~ s/evt1/evt1a/;
+  _run_command('punlearn', 'tg_resolve_events');
+  _run_command('tg_resolve_events',
+	       'infile='.$new_evt1,
+	       'outfile='.$new_evt1a,
+	       'regionfile='.$new_evt1L1a,
+	       'acaofffile=@'.$pcad_list,
+	       'eventdef=)stdlev1_ACIS',
+	       'clobber=yes',
+	       );
+
+  (my $new_flt1a = $new_evt1) =~ s/evt1/flt1_evt1a/;
+  _run_command('punlearn', 'dmcopy');
+  _run_command('dmcopy',
+	       $new_evt1a.'[EVENTS][@'.$flt1.']',
+	       $new_flt1a,
+	       'opt=all',
+	       'clobber=yes',
+	       );
+
+  my $new_evt2 = _inc_proc(_basename($evt2));
+  my $status = $opts{afterglow} ? '000000000000xxxx0000000000000000' : '0';
+  _run_command('punlearn', 'dmcopy');
+  _run_command('dmcopy',
+	       $new_flt1a."[EVENTS][grade=0,2,3,4,6,status=$status]",
+	       $new_evt2,
+	       'opt=all',
+	       'clobber=yes',
+	       );
+
+  (my $new_dstrk_evt2 = $new_evt2) =~ s/evt2/dstrk_evt2/;
+  _run_command('punlearn', 'destreak');
+  _run_command('destreak',
+	       'infile='.$new_evt2,
+	       'outfile='.$new_dstrk_evt2,
+	       'ccd_id=8',
+	       'clobber=yes',
+	       );
+
+  (my $new_pha2 = $new_evt2) =~ s/evt2/pha2/;
+  _run_command('punlearn', 'tgextract');
+  _run_command('tgextract',
+	       'infile='.$new_evt2,
+	       'outfile='.$new_pha2,
+	       'outfile_type=pha_typeII',
+	       'tg_srcid_list=all',
+	       'tg_part_list=header_value',
+	       'tg_order_list=default',
+	       'ancrfile=none',
+	       'respfile=none',
+	       'clobber=yes',
+	       );
+
+  (my $new_dstrk_pha2 = $new_evt2) =~ s/evt2/dstrk_pha2/;
+  _run_command('punlearn', 'tgextract');
+  _run_command('tgextract',
+	       'infile='.$new_dstrk_evt2,
+	       'outfile='.$new_dstrk_pha2,
+	       'outfile_type=pha_typeII',
+	       'tg_srcid_list=all',
+	       'tg_part_list=header_value',
+	       'tg_order_list=default',
+	       'ancrfile=none',
+	       'respfile=none',
+	       'clobber=yes',
+	       );
+
+  my $new_chips_tgscript = 'chips_tgscript_uxari.ch';
+  open CHIPSTGSCRIPT, $chips_tgscript
+    or die "could not open $chips_tgscript: $!";
+  open NEWCHIPSTGSCRIPT, '> '.$new_chips_tgscript
+    or die "could not create $new_chips_tgscript: $!";
+  while (<CHIPSTGSCRIPT>) {
+    s/^f_evt="(.*)"$/f_evt="$new_evt2"/;
+    print NEWCHIPSTGSCRIPT $_;
+  }
+
+  _run_command('chips', $new_chips_tgscript);
+
+  # pha2 file may not exist if we're running with --noexec
+  my $osip = ($opts{exec} or -f $new_pha2) ?
+    _choose_osip($new_pha2) : 'CHOSEN_OSIP_INSERTED_HERE';
+
+  _run_command('pset', 'mkgarf', 'clobber=yes');
+  if ($grating == HETG) {
+    _run_command($mkgarf,
+		 $new_pha2,
+		 3,
+		 $hegrmf,
+		 $aoff1,
+		 $new_evt2,
+		 $bpix1,
+		 $osip,
+		 $new_l2_base,
+		);
+
+    _run_command($mkgarf,
+		 $new_pha2,
+		 4,
+		 $hegrmf,
+		 $aoff1,
+		 $new_evt2,
+		 $bpix1,
+		 $osip,
+		 $new_l2_base,
+		);
+
+    _run_command($mkgarf,
+		 $new_pha2,
+		 9,
+		 $megrmf,
+		 $aoff1,
+		 $new_evt2,
+		 $bpix1,
+		 $osip,
+		 $new_l2_base,
+		);
+
+    _run_command($mkgarf,
+		 $new_pha2,
+		 10,
+		 $megrmf,
+		 $aoff1,
+		 $new_evt2,
+		 $bpix1,
+		 $osip,
+		 $new_l2_base,
+		);
+
+    _run_command($add_orders,
+		 $new_pha2,
+		 '1', 'HEG',
+		 $new_l2_base.'HEG_-1_garf.fits',
+		 $new_l2_base.'HEG_1_garf.fits',
+		 'NONE',
+		 '',
+		 $new_l2_base,
+		);
+
+    _run_command($add_orders,
+		 $new_pha2,
+		 '1', 'MEG',
+		 $new_l2_base.'MEG_-1_garf.fits',
+		 $new_l2_base.'MEG_1_garf.fits',
+		 'NONE',
+		 '',
+		 $new_l2_base,
+		);
+  }
+  elsif ($grating == LETG) {
+    _run_command($mkgarf,
+		 $new_pha2,
+		 3,
+		 $legrmf,
+		 $aoff1,
+		 $new_evt2,
+		 $bpix1,
+		 $osip,
+		 $new_l2_base,
+		);
+
+    _run_command($mkgarf,
+		 $new_pha2,
+		 4,
+		 $legrmf,
+		 $aoff1,
+		 $new_evt2,
+		 $bpix1,
+		 $osip,
+		 $new_l2_base,
+		);
+
+    _run_command($add_orders,
+		 $new_pha2,
+		 '1', 'LEG',
+		 $new_l2_base.'LEG_-1_garf.fits',
+		 $new_l2_base.'LEG_1_garf.fits',
+		 'NONE',
+		 '',
+		 $new_l2_base,
+		);
+  }
+  else { die "fooey"; }
+
+  chdir $old_dir;
+  return 1;
+}
+
+{
+  my %osip;
+  sub _choose_osip {
+    my $file = shift;
+
+    my $h = CFITSIO::fits_read_header($file);
+
+    exists $h->{'DATE-OBS'} and exists $h->{'OBS_ID'} or die;
+
+    for ('DATE-OBS', 'OBS_ID') {
+      $h->{$_} =~ s/^\s*'\s*//;
+      $h->{$_} =~ s/\s*'\s*$//;
+    }
+
+    my ($year, $month, $day);
+    CFITSIO::ffs2dt($h->{'DATE-OBS'}, $year, $month, $day, my $status=0);
+    $status==0 or die;
+
+    my $date_obs_jd = Astro::ymd2jd($year, $month, $day);
+
+    if (! %osip) {
+      opendir OSIP, $osip_dir or die;
+      my @files = grep /^acisD\d+\-\d+\-\d+osipN\d+\.fits/, readdir OSIP;
+      closedir OSIP;
+
+      for (@files) {
+	my ($y, $m, $d) = /^acisD(\d+)\-(\d+)\-(\d+)/;
+	my $jd = Astro::ymd2jd($y, $m, $d);
+
+	# choose between, say, N004 and N005
+	if (exists $osip{$jd}) {
+	  my ($n1) = $osip{$jd} =~ /N(\d+)/;
+	  my ($n2) = $_ =~ /N(\d+)/;
+	  $osip{$jd} = $osip_dir.'/'.$_ if $n2 > $n1;
+	}
+	else {
+	  $osip{$jd} = $osip_dir . '/' . $_;
+	}
+      }
+    }
+
+    # special case
+    if ($h->{'OBS_ID'} >= 1790 and $h->{'OBS_ID'} <= 1794) {
+      return $osip{Astro::ymd2jd(2000,8,12)}
+    }
+
+    else {
+      # use latest date of osips which are older than our observations
+      return $osip{(sort { $b <=> $a } grep($date_obs_jd>$_,keys %osip))[0]};
+    }
+  }
+}
+
+sub _make_file_hash {
+  my $dir = shift;
+
+  opendir DIR, $dir or die;
+  my @files = grep { /^(?:pcad|acisf).*N\d+_.*\.fits/ and -f "$dir/$_" }
+    readdir DIR;
+  closedir DIR;
+
+  # look for primary, secondary directory files
+  for my $d (qw( primary secondary )) {
+    if (-d "$dir/$d") {
+      opendir DIR, "$dir/$d" or die $!;
+      push @files, map { "$d/$_" } readdir DIR;
+      closedir DIR;
+    }
+  }
+
+  my @types = qw( aoff1 soff1 evt1 evt1a evt2 stat1 src1a mtl1 flt1 bpix1 pha2 );
+
+  my ($l1_base) = (sort { ($a =~ /N(\d+)/)[0] <=> ($b =~ /N(\d+)/)[0] } grep /_evt1\.fits/, @files)[0] =~ /(acisf.*N\d+)/;
+
+  my ($l2_base) = (sort { ($a =~ /N(\d+)/)[0] <=> ($b =~ /N(\d+)/)[0] } grep /_evt2\.fits/, @files)[0] =~ /(acisf.*N\d+)/;
+
+  (my $base_match = $l1_base) =~ s/_\d+N\d+.*//;
+  my ($proc_num)= $l1_base =~ /(N\d+)/;
+
+  my %files;
+  for my $type (@types) {
+    $files{$type} = (grep /\Q$base_match\E(?:_\d+)?\Q$proc_num\E_\Q$type\E\.fits/, @files)[0];
+  }
+
+  $files{l1_base} = $l1_base;
+  $files{l2_base} = $l2_base;
+  $files{pcad_files} = [ grep /pcad.*N\d+_asol1\.fits/, @files ];
+
+  return %files;
+}
+
+sub _run_command {
+  my ($cmd, @args) = @_;
+  print STDERR join(' ', $cmd, map ( "'$_'", @args)),"\n\n";
+  if ($opts{'exec'}) {
+    system($cmd, @args) == 0 or die;
+  }
+}
+
+# increments the processing number on a filename passed through standard
+# processing
+sub _inc_proc {
+  my $file = shift;
+
+  $file =~ s/N(\d+)/'N'.sprintf("%.3d",$1+1)/e;
+  $file =~ s/\.(?:gz|bz2)$//;
+  return $file;
+}
+
+sub _basename {
+  my $name = shift;
+  $name =~ s!(?:.*/)?!!;
+  return $name;
+}
+
+sub _header {
+  my ($file, $extname) = @_;
+  my ($h, $s) = CFITSIO::fits_read_header($file."[$extname]");
+  if ($s != 0) {
+    my $msg;
+    CFITSIO::fits_get_errstatus($s, $msg);
+    $s == 0 or die "error reading $file:\n\t$msg\n";
+  }
+  return $h;
+}
+
+sub _temp {
+  my $h = shift;
+  if ($opts{temp}) {
+    $opts{temp} == -120 or $opts{temp} == -110 or
+      die "temperature option '$opts{temp}' is invalid\n";
+    return $opts{temp};
+  }
+
+  if (!exists $h->{FP_TEMP}) {
+    warn "No temperature keyword found, using -120 (--temp option to override)\n";
+    return -120;
+  }
+
+  my $fudge = 2;
+  if (abs($h->{FP_TEMP} - 153) < $fudge) {
+    return -120;
+  }
+  elsif (abs($h->{FP_TEMP} - 163) < $fudge) {
+    return -110;
+  }
+  else {
+    die "temperature = ".$h->{FP_TEMP}." cannot be dealt with\n";
+  }
+}
+
+
+sub _grating {
+
+  my $h = shift;
+
+  if ($opts{grating}) {
+    die "grating '$opts{grating}' is invalid\n"
+      unless $opts{grating} =~ /^[hl]/i;
+
+    return $opts{grating} =~ /^h/i ? HETG : LETG;
+  }
+
+  else {
+    exists $h->{GRATING} or die
+      "GRATING keyword not found\n";
+
+    (my $g = $h->{GRATING}) =~ s/[^\w]+//g;
+
+    $g =~ /^([lh])/i or
+      die "grating $g is unrecognized\n";
+
+    return $g =~ /^h/i ? HETG : LETG;
+  }
+}
+
+sub _help {
+  print <<EOP;
+Usage: $0 [options] dir1 dir2 ...
+
+  Reprocessed ACIS/grating data. Runs acis_process_events, tgdetect,
+  tg_create_mask, tg_resolve_events, tgextract, mkgarf, chips_tgscript
+  and add_grating_orders. Other details soon...
+
+  --help             show help and exit
+  --version          show version and exit
+  --noexec           do not execute commands
+  --grating=[lh]     do not autodetect grating type
+  --noafterglow      remove afterglow events
+  --temp=[-110,-120] do not autodetect focal plane temperature
+
+EOP
+  exit 0;
+}
+
+sub _version {
+  print $version,"\n";
+  exit 0;
+}

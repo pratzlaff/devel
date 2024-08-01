@@ -1,0 +1,94 @@
+#! /usr/bin/perl -w
+use strict;
+
+=head1 NAME
+
+template - A template for Perl programs.
+
+=head1 SYNOPSIS
+
+cp template newprog
+
+=head1 DESCRIPTION
+
+blah blah blah
+
+=head1 OPTIONS
+
+=over 4
+
+=item --help
+
+Show help and exit.
+
+=item --version
+
+Show version and exit.
+
+=back
+
+=head1 AUTHOR
+
+Pete Ratzlaff E<lt>pratzlaff@cfa.harvard.eduE<gt> July 2005
+
+=head1 SEE ALSO
+
+perl(1).
+
+=cut
+
+my $version = '0.1';
+
+use FindBin;
+use Config;
+use Carp;
+use PDL;
+use Chandra::Tools::Common qw( read_bintbl_cols );
+
+use Getopt::Long;
+my %default_opts = (
+		    );
+my %opts = %default_opts;
+GetOptions(\%opts,
+	   'help!', 'version!', 'debug!',
+	   ) or die "Try --help for more information.\n";
+if ($opts{debug}) {
+  $SIG{__WARN__} = \&Carp::cluck;
+  $SIG{__DIE__} = \&Carp::confess;
+}
+$opts{help} and _help();
+$opts{version} and _version();
+
+@ARGV == 1 or die "Usage: $0 [options] fitsfile\n";
+
+my $fits = shift;
+
+my ($e, $eff) = read_bintbl_cols($fits, 'energy', 'eff', { extname => 'axaf_greff' });
+my @eff = dog $eff->xchg(0,1);
+
+my $max_order = int($eff->getdim(0) / 2);
+
+my @cols = qw( energy );
+push @cols, map { 'om'.$_ } reverse(1..$max_order);
+push @cols, 'oz';
+push @cols, map { 'op'.$_ } 1..$max_order;
+print join("\t", @cols), "\n";
+print join("\t", ('N')x@cols),"\n";
+
+$PDL::IO::Misc::colsep = '';
+
+
+my $fmt = join "\t", ("%6g")x@cols;
+wcols $fmt, $e, @eff;
+
+
+exit 0;
+
+sub _help {
+  exec("$Config{installbin}/perldoc", '-F', $FindBin::Bin . '/' . $FindBin::RealScript);
+}
+
+sub _version {
+  print $version,"\n";
+  exit 0;
+}

@@ -1,0 +1,874 @@
+#! /home/rpete/rpete2/bin/perl_old/perl -w
+use strict;
+
+use Config;
+use lib '/home/rpete/local/perlmods';
+use lib '/home/rpete/local/perlmods/'.$Config{archname};
+
+$| = 1;
+
+use CFITSIO;
+CFITSIO::PerlyUnpacking(0);
+use PDL;
+use PGPLOT;
+use Getopt::Long;
+
+BEGIN {
+    my $hostname = (split /\./ , `hostname`)[0]; chomp $hostname;
+    if ($hostname ne 'legs') {
+	$ENV{LD_LIBRARY_PATH} = '/opt/X11R6/lib:'.($ENV{LD_LIBRARY_PATH} ? $ENV{LD_LIBRARY_PATH} : '');
+	$ENV{PGPLOT_DIR} = '/home/rpete/local/pgplot';
+	$ENV{PGPLOT_FONT} = '/home/rpete/local/pgplot/grfont.dat';
+    }
+};
+
+#
+# This version uses a data-bounding region consisting
+# of opposing second-order polynomials.
+#
+# It also shifts and rotates the events so that zeroeth
+# order is at (0,0) and the dispersion is along the X
+# axis.
+#
+
+#
+# Internally, all calculations are done in microns.
+# $[xy]center are given in the data coordinates.
+#
+
+my %default_opts = (
+		    xcol => 'tg_r', ycol => 'tg_d',
+		    xunit => 'deg', yunit => 'deg', # allowed values are 'deg' and 'pix'
+		    outbase => 'output',
+		    extname => 'events',
+		    dwidth => 304,   # width of data region at centroid, um
+		    bg1width => 1800, bg1off => -200,  # lower bg region params, um
+		    bg2width => 1800, bg2off => 200,   # upper bg region params, um
+		    xcen => 0, ycen => 0, # center of zeroeth order, in input units
+		    binsize => 6.43,      # binning size of spectrum, um
+#		    angle => 0.0183,      # rotate by this amount, counterclockwise deg
+		    angle => 0,           # rotate by this amount, counterclockwise deg
+		    chip3off => 25,       # HRC-S left plate offset, down is positive
+		    fits => 1, rdb => 1,  # output data files
+		    );
+my %opts = %default_opts;
+GetOptions(\%opts,
+	   'help!',
+	   'xcol=s', 'ycol=s',
+	   'xunit=s', 'yunit=s',
+	   'outbase=s',
+	   'extname=s',
+	   'dwidth=i',
+	   'bg1width=i', 'bg1off=i',
+	   'bg2width=i', 'bg2off=i',
+	   'xcen=f', 'ycen=f',
+	   'binsize=f',
+	   'angle=f',
+	   'chip3off=i',
+	   'fits!', 'rdb!',
+	   ) or die "Try \`$0 --help\' for more information\n";
+$opts{help} and help();
+
+@ARGV == 1 or
+    die "$0: missing event file argument\nTry \`$0 --help\' for more information\n";
+my $file = shift;
+
+sub help {
+    print <<EOP;
+Usage: $0 [options] eventfile.fits
+
+Extracts a spectrum from the grating event positions in the given file.
+This program requires a great deal of input, and thus has many options,
+some of which are almost certainly not set to the value you want. Please
+check the below options carefully and set them appropriately where the
+defaults deviate from the conditions of your test setup.
+
+This program uses opposing quadratics to bound the spectral region, as
+well as rectangular background-subtraction regions both below and above
+the spectral region in the cross-dispersion dimension.
+
+As data is read from the input event list, all event positions are translated
+and rotated such that the zeroeth order position is at the origin and the
+dispersion is parallel to the X axis. All calculations are done internally
+in mircons.
+
+Output is in the form of two Postscript files displaying the regions used in
+the extraction, as well as spectrum data outputs in RDB and FITS formats.
+
+  -h,--help       This message.
+  --outbase=s     Preface output files with this string (default is '$default_opts{outbase}').
+  --extname=s     Name of events binary extension (default is '$default_opts{extname}').
+  --xcol=s        Column containing "X" event positions (default is '$default_opts{xcol}').
+  --ycol=s        See --xcol (default is '$default_opts{ycol}').
+  --xunit=s       Units of "X" event positions. Valid values are 'pix' and
+                  'deg' (default is '$default_opts{xunit}').
+  --yunit=s       See --xunit (default is '$default_opts{yunit}').
+  --xcen=f        Position of zeroeth order centroid in "X" dimension, in xcol
+                  units (default is $default_opts{xcen}).
+  --ycen=f        See --xcen (default is $default_opts{ycen}).
+  --angle=f       Rotate events by this amount (in degrees), counterclockwise
+                  (default is $default_opts{angle}).
+  --chip3off=i    Displace HRC-S chip3 event positions by this amount in
+                  microns. Positive is an upward shift of event positions
+                  (default is $default_opts{chip3off}).
+  --binsize=f     Binning size, in microns, of the final spectrum (default is
+                  $default_opts{binsize}).
+  --dwidth=i      Width of spectral data region at zeroeth order, in microns
+                  (default is $default_opts{dwidth}).
+  --bg1width=i    Width of "lower" background region, in microns (default is
+                  $default_opts{bg1width}).
+  --bg1off=i      Displacement of beginning of "lower" background region from
+                  zeroeth order centroid in cross-dispersion direction, in
+                  microns (default is $default_opts{bg1off}).
+  --bg2width=i    See --bg1width, applies to "upper" background region (default
+                  is $default_opts{bg2width}).
+  --bg2off=i      See --bg1off, applies to "upper" background region (default
+                  is $default_opts{bg2off}).
+  --nordb         Do not create RDB-format data output file. This format takes
+                  a very long time to write, so this option can be very
+                  effective at decreasing run time.
+  --nofits        Do not create FITS-format data output file.
+EOP
+
+    exit 0;
+}
+
+#my $ang_per_deg = 173.06929; # from fit of L1.5 tg_lam/tg_r
+my $ang_per_deg = 172.9998307; # from fit of L1.5 tg_lam/tg_r
+my $micron_per_deg = 150600; # derived from tgextract help file
+my $ang_per_micron = $ang_per_deg / $micron_per_deg; # whee
+my $micron_per_pixel = 6.43;
+
+#my $data_coeff_low = [6.99, 3.08e-4, -4.04e-8]; # pixel-space for now
+#my $data_coeff_high = [-6.39, 3.28e-4, 2.37e-8]; # pixel-space for now
+
+#my @coeff_low = (44.9, 3.08e-4, -6.28e-9);
+#my @coeff_high = (-41.1, 3.28e-4, 3.69e-9);
+
+#my $opts{dwidth} = 230; # microns, width of zeroeth order in cross-dispersion
+#my @coeff_low = (18.3, 2.19e-4, -7.49e-9); # obsid62435, plate remained shifted
+#my @coeff_high = (-25.4, 3.28e-4, 5.09e-9);
+
+#my @coeff_low = (35.5, 8.24e-5, -3.67e-9); # obsid62435, plate offset corrected, width=230
+#my @coeff_high = (-27.7, 1.39e-4, 5.16e-9);
+
+#my @coeff_low = (87.28, 1.343e-5, -4.880e-9); # obsid 1459, Sirius B, use width=332
+#my @coeff_high = (-91.04, 2.266e-4, 5.715e-9);
+
+#my @coeff_low = (112.07, -5.342e-05, -7.764e-09); # Olive's raytraces, use width=349
+#my @coeff_high = (-109.51, 4.988e-05, 7.057e-09);
+
+#my @coeff_low = (117.84, 4.112e-05, -8.838e-09); # HZ43, obsid 59, use width=355
+#my @coeff_high = (-122.85, 1.465e-04, 1.054e-08);
+
+my @coeff_low = (96.17, -1.067e-05, -6.516e-09); # HZ43, obsid 59, second attempt use width=304
+my @coeff_high = (-101.17, 1.793e-4, 7.166e-09);
+
+#my @coeff_low = (0,0,0); # temporary
+#my @coeff_high = (0,0,0);
+
+
+my $dev_plots = $opts{outbase}.'_plots.ps/vcps';
+my $dev_image = $opts{outbase}.'_image.ps/cps';
+
+my $DEG_PER_RAD = 180 / 3.14159265359;
+
+$opts{angle} /= $DEG_PER_RAD;  # angle is in radians
+
+# set up units of input data
+my ($yquantum,$xquantum);
+die "$0: xunit must be 'deg' or 'pix'\n" unless
+    ((lc $opts{xunit}) =~ /^(deg|pix)/);
+for ($1) {
+    /deg/ and $xquantum = $micron_per_deg, last;
+    /pix/ and $xquantum = $micron_per_pixel, last;
+}
+
+die "$0: yunit must be 'deg' or 'pix'\n" unless
+    ((lc $opts{yunit}) =~ /^(deg|pix)/);
+for ($1) {
+    /deg/ and $yquantum = -$micron_per_deg, last;
+    /pix/ and $yquantum = $micron_per_pixel, last;
+}
+
+# use only events within this range of centroid in dispersion direction
+my $xspan = 65535 * $micron_per_pixel;
+
+#
+# open the FITS file
+#
+my $s = 0;
+my $fptr = CFITSIO::open_file($file,CFITSIO::READONLY(),$s);
+check_status($s) or die "$0: could not open FITS file '$file'\n";
+
+#
+# move to the correct HDU
+#
+$fptr->movnam_hdu(CFITSIO::ANY_HDU(),$opts{extname},0,$s);
+check_status($s) or die "$0: could not move to table '$opts{extname}', FITS file '$file'\n";
+
+#
+# get number of rows
+#
+my $nrows;
+$fptr->get_num_rows($nrows,$s);
+check_status($s) or die "$0: could not get number of rows in table '$opts{extname}', FITS file '$file'\n";
+$nrows > 0 or die "$0: no events detected in table '$opts{extname}', FITS file '$file'\n";
+
+#
+# obtain column numbers
+#
+my ($xcolnum,$ycolnum,$chipidcolnum);
+$fptr->get_colnum(0,$opts{xcol},$xcolnum,$s);
+$fptr->get_colnum(0,$opts{ycol},$ycolnum,$s);
+check_status($s) or die "$0: could not find columns '$opts{xcol}' and '$opts{ycol}' in FITS file '$file'\n";
+$fptr->get_colnum(0,'chip_id',$chipidcolnum,$s) if $opts{chip3off} != 0;
+check_status($s) or die "$0: could not find column 'chip_id' in FITS file '$file'\n";
+
+my $x = zeroes(double,$nrows);
+my $y = zeroes(double,$nrows);
+
+READ_FITS_DATA: {
+
+    my $n = 100000;
+    $n = $nrows if $nrows < $n;
+
+    my $tmpx = zeroes(double,$n);
+    my $tmpy = zeroes(double,$n);
+
+    # for application of chip 3 offset
+    my $tmpid;
+    if ($opts{chip3off} != 0) {
+	$tmpid = zeroes(short,$n);
+    }
+
+    print STDERR "Reading FITS columns...   % done";
+
+    my $num_rows_done = 0;
+    while ($num_rows_done < $nrows) {
+
+	print STDERR (("\b"x9).sprintf(" %2d",int(100*$num_rows_done/$nrows)).'% done');
+
+	my $num_rows_this_time = $nrows - $num_rows_done;
+	$num_rows_this_time = $n if $num_rows_this_time > $n;
+
+
+	$fptr->read_col_dbl($xcolnum,$num_rows_done+1,1,$num_rows_this_time,0,${$tmpx->get_dataref},undef,$s);
+	$fptr->read_col_dbl($ycolnum,$num_rows_done+1,1,$num_rows_this_time,0,${$tmpy->get_dataref},undef,$s);
+	$tmpx->upd_data;
+	$tmpy->upd_data;
+
+	# re-center at origin
+	$tmpx -= $opts{xcen} if $opts{xcen} != 0;
+	$tmpy -= $opts{ycen} if $opts{ycen} != 0;
+
+	# convert to microns
+	$tmpx *= $xquantum if $xquantum != 1;
+	$tmpy *= $yquantum if $yquantum != 1;
+
+	
+	if ($opts{chip3off} != 0) {
+	    $fptr->read_col_sht($chipidcolnum,$num_rows_done+1,1,$num_rows_this_time,0,${$tmpid->get_dataref},undef,$s);
+	    $tmpid->upd_data;
+	    my $i = which($tmpid == 3);
+	    (my $t1 = $tmpy->index($i)) += $opts{chip3off};
+	}
+
+	# rotate as we set the final arrays
+	my $t1;
+	my $slice = '0:'.($num_rows_this_time-1);
+
+	if ($opts{angle} != 0) {
+	    ($t1 = $x->slice($num_rows_done.':'.($num_rows_done+$num_rows_this_time-1))) .=
+		$tmpx->slice($slice)*cos($opts{angle}) + $tmpy->slice($slice)*sin($opts{angle});
+	    ($t1 = $y->slice($num_rows_done.':'.($num_rows_done+$num_rows_this_time-1))) .=
+		$tmpy->slice($slice)*cos($opts{angle}) - $tmpx->slice($slice)*sin($opts{angle});
+	}
+	else {
+	    ($t1 = $x->slice($num_rows_done.':'.($num_rows_done+$num_rows_this_time-1))) .=
+		$tmpx->slice($slice);
+	    ($t1 = $y->slice($num_rows_done.':'.($num_rows_done+$num_rows_this_time-1))) .=
+		$tmpy->slice($slice);
+	}
+
+	check_status($s) or die "$0: error reading data\n";
+
+	$num_rows_done += $num_rows_this_time;
+    }
+
+    print STDERR (("\b"x9)."100% done\n");
+}
+
+#
+# At this point, all event coordinates have been re-centered and rotated
+#
+
+#
+# $data_x/y        - events use for spectral region
+# $bg_x/y_low/high - events used for background subtraction
+# $all_x/y         - all of the above
+#
+my ($data_x,$data_y,$bg_x_low,$bg_y_low,$bg_x_high,$bg_y_high,$all_x,$all_y);
+
+#
+# Split the data up into little chunks so our temporary piddles
+# don't exhaust our memory.
+#
+FIND_REGIONS: {
+    my $tmp;
+    my $n = 100000;
+    $n = $nrows if $nrows < $n;
+
+    my $data_mask = zeroes(byte,$nrows);
+    my $bg_mask_low = zeroes(byte,$nrows);
+    my $bg_mask_high = zeroes(byte,$nrows);
+    my $all_mask = zeroes(byte,$nrows);
+
+    print STDERR "Finding regions...   % done";
+
+    my $num_rows_done = 0;
+    while ($num_rows_done < $nrows) {
+
+	print STDERR (("\b"x9).sprintf(" %2d",int(100*$num_rows_done/$nrows)).'% done');
+
+	my $num_rows_this_time = $nrows - $num_rows_done;
+	$num_rows_this_time = $n if $num_rows_this_time > $n;
+
+	# indicies of rows to work on this time through the loop
+	my $index = sequence(long,$num_rows_this_time) + $num_rows_done;
+	my $yregion = $y->index($index);
+	my $xregion = $x->index($index);
+
+	($tmp = $data_mask->index(which(
+				       $yregion > $coeff_low[0]+$coeff_low[1]*$xregion+$coeff_low[2]*$xregion**2 - $opts{dwidth}/2 &
+				       $yregion < $coeff_high[0]+$coeff_high[1]*$xregion+$coeff_high[2]*$xregion**2 + $opts{dwidth}/2 &
+				       $xregion < $xspan/2 &
+				       $xregion > -$xspan/2
+				       ) + $num_rows_done
+				 )
+	 ) += 1;
+
+	($tmp = $bg_mask_low->index(which(
+					  $yregion > ($opts{bg1off} - $opts{bg1width}) &
+					  $yregion < $opts{bg1off} &
+					  $xregion < $xspan/2 &
+					  $xregion > -$xspan/2
+				      ) + $num_rows_done
+				)
+	 ) += 1;
+	($tmp = $bg_mask_high->index(which(
+					   $yregion < ($opts{bg2off} + $opts{bg2width}) &
+					   $yregion > $opts{bg2off} &
+					   $xregion < $xspan/2 &
+					   $xregion > -$xspan/2
+				      ) + $num_rows_done
+				)
+	 ) += 1;
+
+	$num_rows_done += $num_rows_this_time;
+    }
+    $data_x = $x->index(which($data_mask));
+    $data_y = $y->index(which($data_mask));
+
+    $bg_x_low = $x->index(which($bg_mask_low));
+    $bg_y_low = $y->index(which($bg_mask_low));
+
+    $bg_x_high = $x->index(which($bg_mask_high));
+    $bg_y_high = $y->index(which($bg_mask_high));
+
+    $all_x = $x->index(which($data_mask | $bg_mask_low | $bg_mask_high));
+    $all_y = $y->index(which($data_mask | $bg_mask_low | $bg_mask_high));
+
+
+    print STDERR (("\b"x9)."100% done\n");
+}
+
+print STDERR <<EOP;
+
+Original events:                 ${\($x->nelem)}
+Lower background region events:  ${\($bg_x_low->nelem)}
+Data region events:              ${\($data_x->nelem)}
+Upper background region events:  ${\($bg_x_high->nelem)}
+
+Lower background events: X[min,max] = [${\(sprintf("%.1e, %.1e",$bg_x_low->min/$xquantum,$bg_x_low->max/$xquantum))}], Y[min,max] = [${\(sprintf("%.1e, %.1e",$bg_y_low->min/$yquantum,$bg_y_low->max/$yquantum))}]
+Data events:             X[min,max] = [${\(sprintf("%.1e, %.1e",$data_x->min/$xquantum,$data_x->max/$xquantum))}], Y[min,max] = [${\(sprintf("%1.e, %.1e",$data_y->min/$yquantum,$data_y->max/$yquantum))}]
+Upper background events: X[min,max] = [${\(sprintf("%.1e, %.1e",$bg_x_high->min/$xquantum,$bg_x_high->max/$xquantum))}], Y[min,max] = [${\(sprintf("%.1e, %.1e",$bg_y_high->min/$yquantum,$bg_y_high->max/$yquantum))}]
+EOP
+
+
+# get ready to plot
+pgbeg(0,$dev_plots,1,3);
+
+#
+# give all arrays common limits so we can add them cleanly later
+#
+
+my $smin=max(pdl($data_x->min,$bg_x_low->min,$bg_x_high->min));
+my $smax=min(pdl($data_x->max,$bg_x_low->max,$bg_x_high->max));
+
+if ($smin >= 0) {
+    $smin -= $smin % $opts{binsize};
+}
+else {
+    $smin -= $opts{binsize} * (1 - ( int($smin/$opts{binsize}) - $smin/$opts{binsize}));
+}
+$smax += $opts{binsize} - (($smax-$smin) % $opts{binsize});
+print "smin = $smin, smax = $smax\n";
+
+my $i;
+
+$i = which($all_x >= $smin & $all_x <= $smax);
+$all_x = $all_x->index($i);
+$all_y = $all_y->index($i);
+
+$i = which($data_x >= $smin & $data_x <= $smax);
+$data_x = $data_x->index($i);
+$data_y = $data_y->index($i);
+
+$i = which($bg_x_low >= $smin & $bg_x_low <= $smax);
+$bg_x_low = $bg_x_low->index($i);
+$bg_y_low = $bg_y_low->index($i);
+
+$i = which($bg_x_high >= $smin & $bg_x_high <= $smax);
+$bg_x_high = $bg_x_high->index($i);
+$bg_y_high = $bg_y_high->index($i);
+
+my ($spectrum_xvals, $all_spectrum, $data_spectrum, $bg_spectrum_low, $bg_spectrum_high);
+($spectrum_xvals,$data_spectrum) = hist($data_x,$smin-$opts{binsize}/2,$smax+$opts{binsize}/2,$opts{binsize});
+$all_spectrum = hist($all_x,$smin-$opts{binsize}/2,$smax+$opts{binsize}/2,$opts{binsize});
+$bg_spectrum_low = hist($bg_x_low,$smin-$opts{binsize}/2,$smax+$opts{binsize}/2,$opts{binsize});
+$bg_spectrum_high = hist($bg_x_high,$smin-$opts{binsize}/2,$smax+$opts{binsize}/2,$opts{binsize});
+
+#
+# make a bunch of plots
+#
+pgenv(
+      $smin, $smax,
+      log10(0.7), $all_spectrum->max ? log10($all_spectrum->max) : log10(0.7),
+      0, 20,
+      );
+pgline(
+       $spectrum_xvals->nelem,
+       $spectrum_xvals->float->get_dataref,
+       $all_spectrum->log10->badmask(log10(0.7))->float->get_dataref,
+       );
+pglab('dispersion (\gm)','events','Data and background regions');
+
+pgenv(
+      $smin, $smax,
+      log10(0.7), $data_spectrum->max ? log10($data_spectrum->max) : log10(0.7),
+      0, 20,
+      );
+pgline(
+       $spectrum_xvals->nelem,
+       $spectrum_xvals->float->get_dataref,
+       $data_spectrum->log10->badmask(log10(0.7))->float->get_dataref,
+       );
+pglab('dispersion (\gm)','events','Data region');
+
+pgenv(
+      $smin, $smax,
+      log10(0.7), $bg_spectrum_low->max ? log10($bg_spectrum_low->max) : log10(0.7),
+      0, 20,
+      );
+pgline(
+       $spectrum_xvals->nelem,
+       $spectrum_xvals->float->get_dataref,
+       $bg_spectrum_low->log10->badmask(log10(0.7))->float->get_dataref,
+       );
+pglab('dispersion (\gm)','events','Lower background region');
+
+pgenv(
+      $smin, $smax,
+      log10(0.7), $bg_spectrum_high->max ? log10($bg_spectrum_high->max) : log10(0.7),
+      0, 20,
+      );
+pgline(
+       $spectrum_xvals->nelem,
+       $spectrum_xvals->float->get_dataref,
+       $bg_spectrum_high->log10->badmask(log10(0.7))->float->get_dataref,
+       );
+pglab('dispersion (\gm)','events','Upper background region');
+
+# do normalized background subtraction
+my $bg_per_micron = ($bg_spectrum_low + $bg_spectrum_high) / ($opts{bg1width} + $opts{bg2width});
+
+my $bgs_yvals_low =
+    $coeff_low[0] +
+    ($coeff_low[1] * $spectrum_xvals) +
+    ($coeff_low[2] * $spectrum_xvals**2) -
+    $opts{dwidth}/2;
+my $bgs_yvals_high =
+    $coeff_high[0] +
+    ($coeff_high[1] * $spectrum_xvals) +
+    ($coeff_high[2] * $spectrum_xvals**2) +
+    $opts{dwidth}/2;
+
+my $data_widths = $bgs_yvals_high - $bgs_yvals_low;
+
+my $final_spectrum = $data_spectrum - ($data_widths * $bg_per_micron);
+
+pgenv(
+      $smin, $smax,
+      $data_widths->min,1.2*$data_widths->max,
+      0,0
+      );
+pgline(
+       $spectrum_xvals->nelem,
+       $spectrum_xvals->float->get_dataref,
+       $data_widths->float->get_dataref,
+       );
+pglab('dispersion (\gm)','width (\gm)','Widths of data region in cross-dispersion direction');
+
+pgenv(
+      $smin, $smax,
+      log10(0.7), $final_spectrum->max ? log10($final_spectrum->max) : log10(0.7),
+      0, 20
+      );
+pgline(
+       $spectrum_xvals->nelem,
+       $spectrum_xvals->float->get_dataref,
+       $final_spectrum->log10->badmask(log10(0.7))->float->get_dataref,
+       );
+pglab('dispersion (\gm)','events','Final extracted spectrum');
+
+pgclos();
+
+pgbeg(0,$dev_image,1,1);
+
+my $npix = 512;
+my $min = 0;
+my $max = 5;
+my $image;
+
+# show background regions
+my @xrange = (
+	      min(pdl $data_x->min, $bg_x_low->min, $bg_x_high->min),
+	      max(pdl $data_x->max, $bg_x_low->max, $bg_x_high->max)+$opts{binsize},
+	      );
+my @yrange = (
+	      min(pdl $data_y->min, $bg_y_low->min, $bg_y_high->min),
+	      max(pdl $data_y->max, $bg_y_low->max, $bg_y_high->max)+$opts{binsize},
+	      );
+#my $index = which($x > $xrange[0] & $x < $xrange[1] & $y > $yrange[0] & $y < $yrange[1]);
+$image = histogram2d(
+		     append($bg_x_low,$bg_x_high), append($bg_y_low,$bg_y_high),
+#		     $x->index($index), $y->index($index),
+		     ($xrange[1]-$xrange[0])/$npix, $xrange[0], $npix,
+		     ($yrange[1]-$yrange[0])/$npix, $yrange[0], $npix,
+		     );
+pgenv(@xrange,@yrange,0,0);
+pglab('dispersion (\gm)','cross-dispersion (\gm)',$file);
+pggray(
+       $image->float->get_dataref,
+       $image->dims, 1, ($image->dims)[0], 1, ($image->dims)[1],
+       $min, $max,
+       [
+	$xrange[0], ($xrange[1]-$xrange[0])/$npix, 0,
+	$yrange[0], 0, ($yrange[1]-$yrange[0])/$npix ,
+	],
+       );
+
+# image of data region events
+@xrange = ($data_x->min, $data_x->max+$opts{binsize});
+@yrange = ($data_y->min,$data_y->max+$opts{binsize});
+$image = histogram2d(
+		     $data_x, $data_y,
+		     ($xrange[1]-$xrange[0])/$npix, $xrange[0], $npix,
+		     ($yrange[1]-$yrange[0])/$npix, $yrange[0], $npix,
+		     );
+pgenv(@xrange,@yrange,0,0);
+pglab('dispersion (\gm)','cross-dispersion (\gm)',$file);
+pggray(
+       $image->float->get_dataref,
+       $image->dims, 1, ($image->dims)[0], 1, ($image->dims)[1],
+       $min, $max,
+       [
+	$xrange[0], ($xrange[1]-$xrange[0])/$npix, 0,
+	$yrange[0], 0, ($yrange[1]-$yrange[0])/$npix ,
+	],
+       );
+
+# image of all events in data region
+my $gi = which(
+	       $x > $xrange[0] & $x < $xrange[1] &
+	       $y > $yrange[0] & $y < $yrange[1]
+	       );
+$image = histogram2d(
+		     $x->index($gi), $y->index($gi),
+		     ($xrange[1]-$xrange[0])/$npix, $xrange[0], $npix,
+		     ($yrange[1]-$yrange[0])/$npix, $yrange[0], $npix,
+		     );
+pgenv(@xrange,@yrange,0,0);
+pglab('dispersion (\gm)','cross-dispersion (\gm)',$file);
+pggray(
+       $image->float->get_dataref,
+       $image->dims, 1, ($image->dims)[0], 1, ($image->dims)[1],
+       $min, $max,
+       [
+	$xrange[0], ($xrange[1]-$xrange[0])/$npix, 0,
+	$yrange[0], 0, ($yrange[1]-$yrange[0])/$npix ,
+	],
+       );
+
+pgsci(2);
+pgline($bgs_yvals_high->nelem,
+       $spectrum_xvals->float->get_dataref,
+       $bgs_yvals_high->float->get_dataref,
+       );
+pgline($bgs_yvals_low->nelem,
+       $spectrum_xvals->float->get_dataref,
+       $bgs_yvals_low->float->get_dataref,
+       );
+pgsci(1);
+
+pgclos();
+
+#
+# write RDB output
+#
+my $rdb_file = "$opts{outbase}.rdb";
+(write_rdb_file($rdb_file,$spectrum_xvals, $data_spectrum, $data_widths,
+	       $bg_spectrum_low, $opts{bg1width}, $bg_spectrum_high, $opts{bg2width}
+	       ) or
+    warn "$0: could not write RDB file '$rdb_file'") if $opts{rdb};
+
+#
+# write FITS output
+#
+my $fits_file = "!$opts{outbase}.fits";
+(write_fits_file($fits_file,$fptr,
+		$spectrum_xvals, $data_spectrum, $data_widths,
+		$bg_spectrum_low, $opts{bg1width}, $bg_spectrum_high, $opts{bg2width}
+		) or
+    warn "$0: could not write FITS file '$fits_file'") if $opts{fits};
+
+$fptr->close_file($s);
+check_status($s) or warn("$0: error closing FITS file '$file'\n");
+
+print STDERR "All done\n";
+
+exit 0;
+
+# for now, output rdb table with wavelength, data (non-bg-subtracted) events,
+# background events scaled to size of data region
+sub write_rdb_file {
+    my $f = shift;
+    my ($x, $spec, $spec_widths, $bg1, $bg1_width, $bg2, $bg2_width) = @_;
+
+    open(RDB,">$f") or
+	warn("could not open output file '$f': $!"), return;
+    print RDB <<EOP;
+# $f - Created by $0: ${\(scalar localtime)}
+#
+# Input parameters
+# ----------------
+# input_file: $file
+# x_column: $opts{xcol}
+# y_column: $opts{ycol}
+#
+# Output Parameters
+# -----------------
+# binsize: $opts{binsize} (um)
+# xspan: $xspan (um)
+#
+# Transformation parameters
+# -------------------------
+# x_center: $opts{xcen} ($opts{xcol})
+# y_center: $opts{ycen} ($opts{ycol})
+# clocking_angle: ${\($opts{angle} * $DEG_PER_RAD)} (deg)
+# xquantum: $xquantum (um/$opts{xcol})
+# yquantum: $yquantum (um/$opts{ycol})
+# chip3_offset: $opts{chip3off} (um)
+#
+# Background Region Parameters
+# ----------------------------
+# bg_start_low: $opts{bg1off} (um)
+# bg_width_low: $bg1_width (um)
+# bg_start_high: $opts{bg2off} (um)
+# bg_width_high: $bg2_width (um)
+#
+# Data Region Parameters
+# ----------------------
+# data_width_base: $opts{dwidth} (um)
+# lower_bound_coeffs: [@coeff_low]
+# upper_bound_coeffs: [@coeff_high]
+#
+# Miscellaneous Assumptions
+# -------------------------
+# $micron_per_pixel um/pixel
+# $micron_per_deg um/deg
+# $ang_per_deg AA/deg
+#
+# Output Column Explanations
+# --------------------------
+# lam    = wavelength (AA)
+# data   = non-background-subtracted data region events
+# bg     = background events scaled to size of data region
+# bg1    = background events, first region.
+# bg2    = background events, second region.
+#
+lam	data	bg	bg_low	bg_high
+N	N	N	N	N
+EOP
+
+    my $bg_all_norm = (($bg1 + $bg2) * $spec_widths) /
+	($bg1_width + $bg2_width);
+    $PDL::IO::Misc::colsep = '';
+    wcols "%.6f\t%d\t%.3f\t%d\t%d", $x*$ang_per_micron, $spec, $bg_all_norm, $bg1, $bg2, *RDB;
+    close RDB;
+
+    return 1;
+}
+
+#
+# write FITS output file
+#
+sub write_fits_file {
+    my ($f, $infptr) = (shift, shift);
+    my ($x, $spec, $spec_widths, $bg1, $bg1_width, $bg2, $bg2_width) = @_;
+
+    my $s = 0;
+
+    # create output file
+    my $outfptr = CFITSIO::create_file($f,$s);
+    check_status($s) or
+	warn("$0: could not create FITS file '$f'\n"),
+	return;
+
+    # copy the input file header to the output file
+    my $infptr_hdu_save;
+    $infptr->get_hdu_num($infptr_hdu_save);
+    $infptr->movabs_hdu(1,undef,$s);
+    $infptr->copy_header($outfptr,$s);
+    check_status($s) or
+	warn("$0: error copying header to output FITS file '$f'\n"),
+	$outfptr->delete_file($s),
+	return;
+
+    $infptr->movabs_hdu($infptr_hdu_save,undef,$s);
+
+    # overwrite ORIGIN, CREATOR, CHECKSUM, DATE keywords
+    $outfptr->modify_key_str('ORIGIN','rpete',undef,$s);
+    check_status($s) or
+	warn("$0: could not modify header keyword 'ORIGIN'\n"),
+	$s = 0;
+
+    my $progname = $0;
+    $progname =~ /.*\/(.*?)$/ and $progname = $1;
+    $outfptr->modify_key_str('CREATOR',$progname,undef,$s);
+    check_status($s) or
+	warn("$0: could not modify header keyword 'CREATOR'\n"),
+	$s = 0;
+
+    my $timestr = ''; my $timeref;
+  CFITSIO::fits_get_system_time($timestr,$timeref,$s);
+    check_status($s) or
+	warn("$0: error getting system time\n"),
+	$s = 0;
+    $outfptr->modify_key_str('DATE',$timestr,undef,$s);
+    check_status($s) or
+	warn("$0: could not modify header keyword 'DATE'\n"),
+	$s = 0;
+
+    $outfptr->update_chksum($s);
+    check_status($s) or
+	warn("$0: error while updating header checksum\n"),
+	$outfptr->delete_file($s),
+	return;
+
+    #
+    # create new binary table
+    #
+    my $extname = 'SPECTRUM';
+    my @ttype = qw( lam  data    bg   bg1   bg2);
+    my @tform = qw( 1D   1J      1E   1J    1J );
+    my @tunit = qw( AA   events  events events events);
+    $outfptr->create_tbl(CFITSIO::BINARY_TBL(),0,scalar @ttype,
+			 \@ttype, \@tform, \@tunit, $extname, $s);
+    check_status($s) or
+	warn("$0: error creating binary table\n"),
+	$outfptr->delete_file($s),
+	return;
+
+    # input parameters
+    $outfptr->write_key_str('INFILE',$file,'input event list',$s);
+    $outfptr->write_key_str('XCOLUMN',$opts{xcol},'dispersion column',$s);
+    $outfptr->write_key_str('YCOLUMN',$opts{ycol},'cross-dispersion column',$s);
+
+    # output parameters
+    $outfptr->write_key_dbl('BINSIZE',$opts{binsize},3,'(um)',$s);
+    $outfptr->write_key_lng('XSPAN',$xspan,'(um)',$s);
+    
+    # transformation parameters
+    $outfptr->write_key_dbl('XCENTER',$opts{xcen},4,"($opts{xcol})",$s);
+    $outfptr->write_key_dbl('YCENTER',$opts{ycen},4,"($opts{ycol})",$s);
+    $outfptr->write_key_dbl('ANGLE',$opts{angle}*$DEG_PER_RAD,4,'(deg)',$s);
+    $outfptr->write_key_dbl('XQUANTUM',$xquantum,4,"(um/$opts{xcol})",$s);
+    $outfptr->write_key_dbl('YQUANTUM',$yquantum,4,"(um/$opts{ycol})",$s);
+    $outfptr->write_key_lng('CHIP3OFF',$opts{chip3off},'(um)',$s);
+
+    # background parameters
+    $outfptr->write_key_lng('BG1OFF',$opts{bg1off},'(um)',$s);
+    $outfptr->write_key_lng('BG1SIZE',$opts{bg1width},'(um)',$s);
+    $outfptr->write_key_lng('BG2OFF',$opts{bg2off},'(um)',$s);
+    $outfptr->write_key_lng('BG2SIZE',$opts{bg2width},'(um)',$s);
+
+    # data size paramters
+    $outfptr->write_key_lng('DATABASE',$opts{dwidth},'(um)',$s);
+    $outfptr->write_key_str('COEFFLOW',"[@coeff_low]",undef,$s);
+    $outfptr->write_key_str('COEFFHI',"[@coeff_high]",undef,$s);
+
+    # miscellany
+    $outfptr->write_key_dbl('UM_PIX',$micron_per_pixel,8,'(um/pixel)',$s);
+    $outfptr->write_key_dbl('UM_DEG',$micron_per_deg,8,'(um/deg)',$s);
+    $outfptr->write_key_dbl('ANG_DEG',$ang_per_deg,8,'(AA/deg)',$s);
+
+    check_status($s) or
+	warn("$0: error writing keywords"),
+	$s = 0;
+
+    $outfptr->write_col_dbl(1,1,1,$x->nelem,
+			    ($x*$ang_per_micron)->double->get_dataref,$s);
+
+    $outfptr->write_col_lng(2,1,1,$spec->nelem,
+			    $spec->long->get_dataref,$s);
+
+    my $bg_all_norm = (($bg1 + $bg2) * $spec_widths) /
+	($bg1_width + $bg2_width);
+    $outfptr->write_col_flt(3,1,1,$bg_all_norm->nelem,
+			    $bg_all_norm->float->get_dataref,$s);
+
+    $outfptr->write_col_lng(4,1,1,$bg2->nelem,
+			    $bg1->long->get_dataref,$s);
+
+    $outfptr->write_col_lng(5,1,1,$bg2->nelem,
+			    $bg2->long->get_dataref,$s);
+
+    check_status($s) or
+	warn("$0: error writing binary table columns"),
+	$outfptr->delete_file($s),
+	return;
+
+    $outfptr->close_file($s);
+    check_status($s) or
+	warn("$0: error closing output FITS file '$f'"),
+	$s = 0;
+
+    return 1;
+}
+
+
+sub check_status {
+    my $s = shift;
+    if ($s != 0) {
+	my $txt;
+      CFITSIO::fits_get_errstatus($s,$txt);
+	print STDERR <<EOP;
+$0: CFITSIO error detected: $txt
+EOP
+	return 0;
+    }
+
+    return 1;
+}

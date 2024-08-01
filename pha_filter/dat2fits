@@ -1,0 +1,194 @@
+#! /usr/bin/perl -w
+use strict;
+
+use CFITSIO;
+use PDL;
+use Getopt::Long;
+use Carp;
+
+my $VERSION = '0.1';
+
+my %opts = ();
+GetOptions(\%opts,
+	   'help!', 'version!',
+	   ) or die "Try \`$0 --help\' for more information\n";
+$opts{help} and help();
+$opts{version} and _version();
+
+@ARGV == 2 or
+	die "$0: invalid arguments\nTry \`$0 --help\' for more information\n";
+my ($infile,$outfile) = (shift, shift);
+
+my ($u,$v,$pha_low,$pha_high) = _read_filter_file($infile);
+defined $u and UNIVERSAL::isa($u,'PDL') or
+    croak "error reading input PHA filter file '$infile'";
+
+_write_filter_file($outfile,$u,$v,$pha_low,$pha_high) or
+    croak "error writing output PHA filter file '$outfile'";
+
+exit 0;
+
+sub _read_filter_file {
+
+    my $file = shift;
+    print STDERR "Reading PHA filter file '$file'...";
+
+   # Count lines up to first data, so rcols() doesn't have to test
+    # a regex on every line.
+    open(FH,$file) or
+	carp("could not open PHA filter file '$file': $!"),
+	return;
+    my $line;
+    my $lcount = 0;
+    while(defined($line = <FH>)) {
+	$line =~ /^\s*[\d\.]/ and last;
+	$lcount++;
+    }
+    defined $line or
+	carp("empty PHA filter file '$file'"),
+	close(FH),
+	return;
+
+    seek(FH,0,0); # go back to beginning
+    my ($u,$v,$pha_low,$pha_hi) = rcols *FH, { LINES => "$lcount:" };
+    close(FH);
+
+    print STDERR "done\n";
+
+    $u = $u->long;
+    $v = $v->long;
+    $pha_low = $pha_low->long;
+    $pha_hi = $pha_hi->long;
+    return ($u, $v, $pha_low, $pha_hi);
+}
+
+sub _write_filter_file {
+
+    my $file = shift;
+
+    my ($u,$v,$pha_low,$pha_high) = @_;
+
+    my $status = 0;
+    my $fptr = CFITSIO::create_file($file,$status);
+
+    my $extname = 'PHALIM';
+    my @ttype = qw( lab_u lab_v pha_low pha_high );
+    my @tform = qw( 1J    1J    1J      1J );
+    $fptr->create_tbl(CFITSIO::BINARY_TBL(),0,scalar @ttype,
+		      \@ttype, \@tform, undef, $extname, $status);
+
+    $fptr->write_col(_match_datatype($u),1,1,1,$u->nelem,$u->get_dataref,$status);
+    $fptr->write_col(_match_datatype($v),2,1,1,$v->nelem,$v->get_dataref,$status);
+    $fptr->write_col(_match_datatype($pha_low),3,1,1,$pha_low->nelem,$pha_low->get_dataref,$status);
+    $fptr->write_col(_match_datatype($pha_high),4,1,1,$pha_high->nelem,$pha_high->get_dataref,$status);
+
+    _check_status($status) or
+	$fptr->delete_file($status=0),
+	return;
+
+    $fptr->close_file($status);
+
+    return 1;
+}
+
+
+sub help {
+
+    print <<EOP;
+Usage: $0 [options] infile outfile
+
+  Converts a PHA filtering file, consisting of u, v, pha_low and pha_high
+  columns in RDB format, into a FITS file.
+
+  Options:
+  --help         This message.
+  --version      Print version information.
+
+  BUGS:
+    * Output FITS file is minimal.
+
+  Author:
+    Pete Ratzlaff <pratzlaff\@cfa.harvard.edu>
+
+EOP
+
+    exit 0;
+}
+
+# Check CFITSIO status.
+sub _check_status($) {
+    my $status = shift;
+    if ($status != 0) {
+	my $txt;
+      CFITSIO::fits_get_errstatus($status,$txt);
+	print STDERR "CFITSIO error detected: $txt\n";
+	return 0;
+    }
+
+    return 1;
+}
+
+sub _version() {
+    print "$0, version $VERSION\n";
+    exit 0;
+}
+
+#
+# find appropriate CFITSIO datatype for a given piddle type.
+# Can be passed the piddle itself or a PDL::Type token (e.g.,
+# float() with no args).
+#
+sub _match_datatype {
+    my $arg = shift;
+
+    my $invalid_cfitsio_type = -1;
+
+    my $pdl_type;
+    if (UNIVERSAL::isa($arg,'PDL')) {
+	$pdl_type = $arg->get_datatype;
+    }
+    else {
+	$pdl_type = $arg->[0];
+    }
+
+    my $pdl_size = PDL::Core::howbig($pdl_type);
+
+    my @cfitsio_possible_types;
+    # test for real datatypes
+    if ($pdl_type == float(1)->get_datatype or
+	$pdl_type == double(1)->get_datatype
+	)
+    {
+	@cfitsio_possible_types = (
+				 CFITSIO::TDOUBLE(),
+				 CFITSIO::TFLOAT(),
+				   );
+    }
+    elsif ($pdl_type == short(1)->get_datatype or
+	   $pdl_type == long(1)->get_datatype
+	   )
+    {
+	@cfitsio_possible_types = (
+				 CFITSIO::TSHORT(),
+				 CFITSIO::TINT(),
+				 CFITSIO::TLONG(),
+				   );
+    }
+    elsif ($pdl_type == ushort(1)->get_datatype or
+	   $pdl_type == byte(1)->get_datatype
+	   )
+    {
+	@cfitsio_possible_types = (
+				 CFITSIO::TBYTE(),
+				 CFITSIO::TUSHORT(),
+				 CFITSIO::TUINT(),
+				 CFITSIO::TULONG(),
+				   );
+    }
+
+
+    foreach my $cfitsio_type (@cfitsio_possible_types) {
+	return $cfitsio_type if $pdl_size == CFITSIO::sizeof_datatype($cfitsio_type);
+    }
+    return $invalid_cfitsio_type;
+}

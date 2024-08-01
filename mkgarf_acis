@@ -1,0 +1,280 @@
+#!/bin/sh
+
+# Time-stamp: <00/09/12 13:43:21 dph> 
+# MIT Directory: ~dph/h3/CXC/Expmap/Script_Specs/
+# CfA Directory: /dev/null
+# File: mkgarf_hetgs; now named mkgarf_acis
+# Author: DPH
+# Original version: 2000.04.??
+# Modified: 2000.05.17  added test for asoff and asphist files
+#                       fixed bug in badpix file test.
+#           2000.09.12  inspected for pha Type I compliance: NOT!
+#                       Currently looks for x,y,tg_m,tg_part from the 
+#                       specified row in the pha II file, in which these
+#                       parameters are columns.  In a Type I, they are
+#                       header keywords.
+#           2000.10.17  updated syntax (rmffile -> engrid) ecg
+#           2000.10.19  renamed "mkgarf_acis" ecg
+#           2001.02.05  added "punlearn ardlib.par" to end ecg 
+#           2001.05.10  added "osip" parameters ecg
+#====================================================================
+
+
+# make full ACIS ARF for +-nth order, one grating type (HEG, MEG, or LEG)
+#   run mkgarf on detector subsystems and combine.
+#   Use pha2 Type II file for reference.
+#    (could use Type I header)
+#
+# PREREQUISITES: good GTI's exist; data have been filtered, merged.
+#                GTI's are in evt2 file.
+#
+
+if [ "$1" = "" ]; then
+  echo ""
+  echo "USAGE: $0  pha row rmf aoff evt2 bpix osip root"
+  echo ""
+  echo "    Compute the ARF for +-'order' for the grating and order found in "
+  echo "    row 'row' of file 'pha' SPECTRUM extension, with  'rmf' for "
+  echo "     the energy grid, and observational files aoff, evt2 (for GTI), "
+  echo "     and bpix."
+  echo "  Output files will have names 'root_ssss.fits'."
+  echo ""
+  echo "EXAMPLES:  "
+  echo ""
+  echo "mkgarf_acis acisf0145N003_pha2.fits 9 acismeg1D1999-07-22rmfN0001.fits acisf0145N001_aoff1.fits acisf0145N003_evt2.fits acisf0145N001_bpix1.fits acisD1999-09-16osipN0998.fits  acisf01451N001"
+  echo "                 pha2                 row     grating_rmf                      offsets                 events                       badpix               osip                      root_name   "
+  echo ""
+  echo " (This is a shell script; you can alter it to suit your own tastes.)"
+  echo ""
+  exit 1
+fi
+
+f_pha=$1
+pha_row=$2
+f_rmf=$3      # reference grating rmf file (input, string), for energy grid
+
+
+# Cannot count on all obs files having same root name.  E.g., events could
+# have undergone re-processing, but offsets and bpix remain the same.
+#        # expect to have in current directory:
+#        # events: ${root}_evt2.fits
+#	# pha:    ${root}_pha2.fits
+#        # aspect offsets filename expected to be ${root}_aoff1.fits
+#        # Level 2 events filename expected to be ${root}_evt2.fits
+
+#
+#f_aoff=${root}_aoff1.fits      # aspect offsets
+#f_evt=${root}_evt2.fits        # event file (for GTI and region)
+#f_bpix=${root}_bpix1.fits      # bad pixel table
+##f_pha=${root}_pha2.fits        # pha2 file, with region extension. #(don't need)
+
+f_aoff=$4      # aspect offsets
+f_evt=$5       # event file (for GTI and region)
+f_bpix=$6      # bad pixel table
+f_osip=$7      # order-sorting/integrated prob table
+root=$8        # observation root name, without "_evt2.fits". (string)
+
+############################################################################
+# check files' existence before doing anything:
+#
+if [ ! -f ${f_pha} -a ! -f ${f_pha}.gz ]; then
+  echo "Error.  No pha file with given root-name: ${f_pha}."
+  exit 1
+fi 
+#
+if [ ! -f ${f_aoff} -a ! -f ${f_aoff}.gz ]; then
+  echo "Error.  No offsets file with given root-name: ${f_aoff}."
+  exit 1
+fi 
+#
+if [ ! -f ${f_evt} -a  ! -f ${f_evt}.gz ]; then
+  echo "Error.  No events file with given root-name: ${f_evt}."
+  echo "Event file is required with a REGION and GTI tables."
+  exit 1
+fi 
+#
+SET_BPIX_FILE=1
+if [ ! -f ${f_bpix} -a  ! -f ${f_bpix}.gz ]; then
+  echo "Warning.  No bad-pixel file with given root-name: ${f_bpix}."
+  echo '  Using current default (ardlib.par) value.'
+  echo '  (if totally frustrated, specify "NONE") '
+  SET_BPIX_FILE=0
+fi 
+#
+if [ ! -f ${f_osip} -a ! -f ${f_osip}.gz ]; then
+  echo "Warning.  No osip file with given root-name: ${f_osip}."
+  echo 'Using value="NONE".'
+  f_osip='NONE'
+fi
+############################################################################
+
+############################################################################
+# TO DO: for efficiency, add check for existence of aspect histograms.
+#        if present, skip to bpix.
+
+# apply sim offsets to aspect offsets
+#
+echo "Apply sim component to offsets: asp_apply_sim ... "
+f_asoff=${root}_asoff.fits
+if [ ! -f ${f_asoff}  -a ! -f ${f_asoff}.gz ] ;  then
+  asp_apply_sim infile=${f_aoff} outfile=${f_asoff} verb=0 mode="hl";
+fi
+  
+
+# make aspect histograms per chip
+#
+echo -n Make/test for aspect histograms...
+for ccd in 4 5 6 7 8 9
+#!for ccd in  5 6 7 8 9
+  do echo -n $ccd " ";
+  if [ ! -f ${root}_ah${ccd}.fits -a  ! -f ${root}_ah${ccd}.fits.gz ]; then
+    asphist infile=${f_asoff} outfile=${root}_ah${ccd}.fits gtifile=${f_evt}"[ccd_id=${ccd}]" dtffile=${f_evt}"[EVENTS]" verb=0;
+  fi
+done
+############################################################################
+
+# set ardlib badpix to flight badpix file (merged flight and ardlib)
+#
+
+if [ ${SET_BPIX_FILE} -eq 1 ]; then
+  echo ""
+  echo -n "Set badpix param..."
+  for ccd in 4 5 6 7 8 9
+#!  for ccd in 5 6 7 8 9
+  do echo -n "$ccd  ";
+    pset ardlib AXAF_ACIS${ccd}_BADPIX_FILE=${f_bpix}"[BADPIX${ccd}]";
+  done
+  echo ''
+fi  
+
+# get source position from pha2  file SPECTRUM extension:
+#
+echo Get source position from pha2:
+x=`dmlist ${f_pha}"[SPECTRUM][cols x]" opt=raw,data rows=${pha_row} cells=1:1 verb=0|tail -1` 
+y=`dmlist ${f_pha}"[SPECTRUM][cols y]" opt=raw,data rows=${pha_row} cells=1:1 verb=0|tail -1` 
+
+echo ""
+echo "Got source position, (x,y) = (${x},${y})"
+echo ""
+
+# get grating type from pha2  file SPECTRUM extension:
+#
+tg=`dmlist ${f_pha}"[SPECTRUM][cols tg_part]" opt=raw,data rows=${pha_row} cells=1:1 verb=0|tail -1` 
+# 1 => HEG    2 => MEG   3 => LEG
+echo -${tg}-
+# BUG??? the tg=` line creates and invisible char; space? or control?
+tg=`echo ${tg}`
+case ${tg} in 
+   "1") echo $tg; grating=HEG;;
+   "2") echo $tg; grating=MEG;;
+   "3") echo $tg; grating=LEG;;
+esac
+echo "Got grating type: " "'"${grating}"'"
+
+# get diffraction order from pha2  file SPECTRUM extension:
+#
+echo Get order from pha2:
+order=`dmlist ${f_pha}"[SPECTRUM][cols tg_m]" opt=raw,data rows=${pha_row} cells=1:1 verb=0|tail -1` 
+order=`echo $order`
+echo "Got order " "'"${order}"'"
+
+## make the gARFs
+#
+echo ""
+echo -n "Coffee break!  Making chip arfs. This will take a while...."
+
+pset mkgarf mirror="HRMA"
+pset mkgarf sourcepixelx=${x}
+pset mkgarf sourcepixely=${y}
+
+echo ""
+if [ $order -lt 0 ]; then
+  for idet in 0 1 2 3
+#!  for idet in 1 2 3           # only if FEP0 problem
+     do det=ACIS-S$idet;
+     iarm=$grating;
+     out=${root}_S${idet}_${iarm}_${order}.fits;
+     rmf=${f_rmf};
+     ccdid=`expr $idet + 4`;
+     asp=${root}_ah${ccdid};
+     osip=${f_osip};
+     echo ............  $out ................;
+  
+  echo    mkgarf detsubsys=$det  \
+	    order=$order \
+	    grating_arm=$iarm \
+	    outfile=$out \
+	    asphistfile=${asp}.fits"[ASPHIST]" \
+	    engrid="grid($rmf[cols ENERG_LO,ENERG_HI])" \
+	    osipfile=$osip \
+            mode="hl" verb=0;
+  
+     mkgarf detsubsys=$det  \
+	    order=$order \
+	    grating_arm=$iarm \
+	    outfile=$out \
+	    asphistfile=${asp}.fits"[ASPHIST]" \
+	    engrid="grid($rmf[cols ENERG_LO,ENERG_HI])" \
+            osipfile=$osip \
+	    mode="hl" verb=0;
+  done;
+
+  echo "Done with all gARF pieces.  Add them...";
+  
+  ######## add the gARFs..................
+  #
+  type=${grating}_${order}_garf.fits;
+  echo "Creating $root$type ...";
+  ls ${root}*${grating}_${order}.fits > tmp.list;
+  dmarfadd @tmp.list $root$type;
+
+fi  
+	  
+
+if [ $order -gt 0 ] ; then 
+
+  for idet in 3 4 5
+  do det=ACIS-S$idet;
+     iarm=${grating};
+     out=${root}_S${idet}_${iarm}_${order}.fits;
+     rmf=${f_rmf};
+     ccdid=`expr $idet + 4`;
+     asp=${root}_ah${ccdid};
+     osip=${f_osip};
+     echo ............  $out ................;
+     echo mkgarf detsubsys=$det  \
+	    order=$order \
+	    grating_arm=$iarm \
+	    outfile=$out \
+	    asphistfile=${asp}.fits"[ASPHIST]" \
+	    engrid="grid($rmf[cols ENERG_LO,ENERG_HI])" \
+            osipfile=$osip \
+	    mode="hl" verb=0;
+
+     mkgarf detsubsys=$det  \
+	    order=$order \
+	    grating_arm=$iarm \
+	    outfile=$out \
+	    asphistfile=${asp}.fits"[ASPHIST]" \
+            osipfile=$osip \
+	    engrid="grid($rmf[cols ENERG_LO,ENERG_HI])" \
+	    mode="hl" verb=0;
+
+  done;
+  echo "Done with all gARF pieces.  Add them...";
+  
+  ######## add the gARFs..................
+  #
+  type=${grating}_${order}_garf.fits;
+  echo "Creating $root$type ...";
+  ls ${root}*${grating}_${order}.fits > tmp.list;
+  dmarfadd @tmp.list $root$type;
+fi
+
+
+rm tmp.list
+punlearn ardlib.par
+
+echo " "
+echo " All done.  You may want to clean up the gARF pieces, "
+echo " if you are satisfied with the results."

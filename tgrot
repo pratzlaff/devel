@@ -1,0 +1,209 @@
+#! /usr/bin/perl -w
+use strict;
+
+=head1 NAME
+
+tgrot - rotate TG_R and TG_D coordinates counterclockwise.
+
+=head1 SYNOPSIS
+
+tgrot [options] infile outfile rotation
+
+=head1 DESCRIPTION
+
+F<infile> should be an event list FITS file containing columns
+TG_R and TG_D. The rotation argument should be in degrees.
+
+=head1 OPTIONS
+
+=over 4
+
+=item --help
+
+Show help and exit.
+
+=item --version
+
+Show version and exit.
+
+=item --tgroff=f, --tgdoff=f
+
+Zeroeth order position for TG_R and TG_D, respectively. With these
+options, the grating coordinates are first translated -tg[r/d]off
+prior to rotation, then +tg[r/d]off subsequent to rotation.
+
+=item --extname=s
+
+Name of the event list binary table. The default name is C<events>.
+
+=back
+
+=head1 HISTORY
+
+=over 4
+
+=item May 2010
+
+Initial version 1.0
+
+=back
+
+=head1 AUTHOR
+
+Pete Ratzlaff E<lt>pratzlaff@cfa.harvard.eduE<gt>
+
+=head1 SEE ALSO
+
+perl(1).
+
+=cut
+
+my $version = '1.0';
+
+use Config;
+use lib '/home/rpete/local/perlmods';
+use lib '/home/rpete/local/perlmods/'.$Config{archname};
+use Astro::FITS::CFITSIO qw(
+			    CASEINSEN TFLOAT TDOUBLE READWRITE BINARY_TBL
+			   );
+use PDL;
+use Carp;
+use FindBin;
+use Getopt::Long;
+use IO::Handle;
+use File::Copy;
+use Math::Trig qw( pi );
+
+my %default_opts = (
+		    extname => 'events',
+		   );
+my %opts = %default_opts;
+GetOptions(\%opts,
+	   'help!', 'version!', 'debug!',
+	   'extname=s', 'tgroff=f', 'tgdoff=f',
+	   ) or die "Try --help for more information.\n";
+
+if ($opts{debug}) {
+  $SIG{__WARN__} = \&Carp::cluck;
+  $SIG{__DIE__} = \&Carp::confess;
+}
+$opts{help} and _help();
+$opts{version} and _version();
+
+@ARGV == 3 or die "Usage: $0 [options] infile outfile rotation\ntry --help for more information\n";
+
+# construct HISTORY entry to be added to output file
+my @argv_copy = @ARGV;
+#s/\\/\\\\/g for @argv_copy;
+s/'/\\'/g for @argv_copy;
+my $history_entry = "$0 ". join(' ', map("'$_'", @argv_copy));
+
+my ($infile, $outfile, $rot) = @ARGV;
+$rot *= pi / 180;
+my $cosrot = cos($rot);
+my $sinrot = sin($rot);
+
+print STDERR "Copying $infile -> $outfile...";
+*STDERR{IO}->flush;
+copy($infile, $outfile) or die $!;
+print STDERR "done\n";
+
+# open output file
+my $status = 0;
+my $outfptr = Astro::FITS::CFITSIO::open_file($outfile, READWRITE, $status);
+check_status($status) or die "error opening output file '$outfile'\n";
+
+# move to the events hdu
+$outfptr->movnam_hdu(BINARY_TBL, $opts{extname}, 0, $status);
+check_status($status) or die "could not move to '$opts{extname}' HDU in $outfile\n";
+
+my $events_hdunum;
+$outfptr->get_hdu_num($events_hdunum);
+
+my %cols = (
+	    tg_r => { ctype => TDOUBLE, ptype => double, },
+	    tg_d => { ctype => TDOUBLE, ptype => double, },
+	   );
+
+for (keys %cols) {
+  $cols{$_}{colnum} = undef;
+  $outfptr->get_colnum(CASEINSEN, $_, $cols{$_}{colnum}, $status);
+  check_status($status) or die "no $_ column found in $opts{extname} HDU from $outfile\n";
+}
+
+my ($nrows, $nrows_at_once);
+$outfptr->get_num_rows($nrows, $status);
+$outfptr->get_rowsize($nrows_at_once, $status);
+
+for (keys %cols) {
+  $cols{$_}{piddle} = zeroes($cols{$_}{ptype}, $nrows_at_once);
+}
+
+if (Astro::FITS::CFITSIO->VERSION > 1.01) {
+  $outfptr->perlyunpacking(0);
+}
+else {
+  Astro::FITS::CFITSIO::PerlyUnpacking(0);
+}
+
+my $nrows_done = 0;
+while ($nrows_done < $nrows) {
+  my $nrows_now = ($nrows_done+$nrows_at_once <= $nrows) ?
+    $nrows_at_once : $nrows-$nrows_done;
+
+  for (keys %cols) {
+    $outfptr->read_col($cols{$_}{ctype}, $cols{$_}{colnum}, $nrows_done+1, 1, $nrows_now, 0, ${$cols{$_}{piddle}->get_dataref}, undef, $status);
+    $cols{$_}{piddle}->upd_data;
+  }
+  check_status($status) or die "error reading data\n";
+
+  # calculate new grating coords
+
+  my $x = $cols{tg_r}{piddle}->copy;
+  my $y = $cols{tg_d}{piddle}->copy;
+
+  $x -= $opts{tgroff} if $opts{tgroff};
+  $y -= $opts{tgdoff} if $opts{tgdoff};
+
+  $cols{tg_r}{piddle} = $x * $cosrot - $y * $sinrot;
+  $cols{tg_d}{piddle} = $x * $sinrot + $y * $cosrot;
+
+  $cols{tg_r}{piddle} += $opts{tgroff} if $opts{tgroff};
+  $cols{tg_d}{piddle} += $opts{tgdoff} if $opts{tgdoff};
+
+  for (keys %cols) {
+    $outfptr->write_col($cols{$_}{ctype}, $cols{$_}{colnum}, $nrows_done+1, 1, $nrows_now, $cols{$_}{piddle}->get_dataref, $status);
+  }
+  check_status($status) or die "error writing data\n";
+
+  $nrows_done += $nrows_now;
+}
+
+$outfptr->write_chksum($status);
+check_status($status) or die "error updating checksum in $outfile\n";
+
+$outfptr->close_file($status);
+check_status($status) or die "error closing $outfile\n";
+
+exit 0;
+
+sub check_status {
+  my $s = shift;
+  if ($s != 0) {
+    my $txt;
+    Astro::FITS::CFITSIO::fits_get_errstatus($s,$txt);
+    carp "CFITSIO error: $txt";
+    return 0;
+  }
+
+  return 1;
+}
+
+sub _help {
+  exec('perldoc', '-F', $FindBin::Bin . '/' . $FindBin::RealScript);
+}
+
+sub _version {
+  print $version,"\n";
+  exit 0;
+}

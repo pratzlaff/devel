@@ -1,0 +1,121 @@
+#! /usr/bin/perl -w
+use strict;
+
+#
+# calculate a "global" deadtime correction
+#
+#
+# TODO:
+#   GTI integration
+#
+
+use PDL;
+use Chandra::Tools::Common;
+use Getopt::Long;
+use CFITSIO;
+use Carp;
+
+my %opts = (
+	    );
+GetOptions(\%opts,
+	   'gtifile=s',
+	   'min=i', 'max=i',
+	   'help!',
+	   );
+
+# dtf file should be sole argument
+@ARGV == 1 or usage();
+
+my $file = shift;
+
+my $status = 0;
+
+#
+# open FITS file
+#
+my $fptr = CFITSIO::open_file($file,CFITSIO::READONLY(),$status);
+check_status($status) or
+    confess "error opening DTF file '$file'";
+
+#
+# move to DTF extension
+#
+$fptr->movnam_hdu(CFITSIO::ANY_HDU(),'dtf',0,$status);
+check_status($status) or
+    confess "extension DTF not found in file '$file'";
+
+#
+# read header
+#
+my $hdr = $fptr->read_header;
+exists $hdr->{TSTART} and exists $hdr->{TSTOP} or
+    confess "DTF file '$file' does not contain both TSTART and TSTOP";
+
+#
+# set minimum and maximum times
+#
+defined $opts{min} or $opts{min} = $hdr->{TSTART};
+defined $opts{max} or $opts{max} = $hdr->{TSTOP};
+($opts{min} <= $opts{max}) or
+    confess "minimum time ($opts{min}) > maximum time ($opts{max})";
+
+#
+# read data
+#
+print STDERR "Reading DTF file...";
+my ($time, $dtf) = read_bintbl_cols($fptr,'time','dtf',{status=>1}) or
+    confess "could not read data from DTF file '$file'";
+print STDERR " done\n";
+
+#
+# close file
+#
+$fptr->close_file($status);
+
+#
+# use only data between specified times
+#
+($opts{min} <= $time->at(0)) and
+    warn "minimum time ($opts{min}) is less than minimum DTF time (${\($time->at(0))})";
+($opts{max} >= $time->at(-1)) and
+    warn "maximum time ($opts{max}) is greater than maximum DTF time (${\($time->at(-1))})";
+
+my $gindex = which($time >= $opts{min} & $time <= $opts{max});
+$gindex->nelem or
+    confess "no DTF data betweeen minimum ($opts{min}) and maximum ($opts{max}) times";
+
+$dtf = $dtf->index($gindex);
+$time = $time->index($gindex);
+
+my ($mean_dtf, $rms_dtf, $median_dtf, $min_dtf, $max_dtf) = stats $dtf;
+my ($mean_tdiff, $rms_tdiff, $median_tdiff, $min_tdiff, $max_tdiff) =
+    stats $time->slice('1:-1') - $time->slice('0:-2');
+
+print <<EOP;
+
+Mean DTF:    $mean_dtf
+Median DTF:  $median_dtf
+DTF RMS:     $rms_dtf
+Min DTF:     $min_dtf
+Max DTF:     $max_dtf
+
+EOP
+
+exit 0;
+
+sub usage {
+    print STDERR <<EOP;
+Usage: $0 [options] dtffile
+
+  Calculates a mean deadtime correction for a single obsid. By default,
+
+  Options:
+    --help        This message.
+    --min         Specify minimum time value (default is TSTART).
+    --max         Specify maximum time value (default is TSTOP).
+    --gtifile     Use intervals in a GTI file (can be combined with --min
+                  and --max). Not yet implemented.
+
+EOP
+    exit 1;
+}

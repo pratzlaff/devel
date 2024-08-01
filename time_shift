@@ -1,0 +1,444 @@
+#! /usr/bin/perl -w
+use strict;
+
+use Config;
+use lib '/home/rpete/local/perlmods';
+use lib '/home/rpete/local/perlmods/'.$Config{archname};
+
+use PDL;
+use CFITSIO;
+use Getopt::Long;
+use Carp;
+
+$| = 1;
+
+my $VERSION = '0.1';
+
+#
+# prototypes
+#
+sub _copy_hdu($$$$);
+sub _time_shift($$);
+sub _open_input_file($);
+sub _open_output_file($);
+sub _get_hdu_nums($$);
+
+my $args = "@ARGV"; # used to write new HISTORY
+
+my %default_opts = (
+		    extname => 'events',
+		    );
+my %opts = %default_opts;
+
+GetOptions(\%opts,
+	   'help!', 'nrows=i', 'extname=s', 'version!',
+	   ) or die "Try \`$0 --help\' for more information.\n";
+$opts{help} and help();
+$opts{version} and _version();
+
+#
+# remaining arguments are input and output files
+#
+@ARGV == 2 or
+  die "$0: invalid arguments\nTry \`$0 --help\' for more information.\n";
+my ($infile,$outfile) = (shift, shift);
+
+#
+# open input and output event list files
+#
+my $status = 0;
+print STDERR "Opening events file '$infile'...";
+my $infptr = _open_input_file($infile) or
+  die "error opening input event file '$infile'";
+print STDERR "done\n";
+my $outfptr = _open_output_file($outfile) or
+  $infptr->close_file($status),
+  die "error opening output event file '$outfile'";
+
+my ($nhdus,$targethdu) = _get_hdu_nums($infptr,$opts{extname}) or
+  $infptr->close_file($status),
+  $outfptr->delete_file($status=0),
+  die "error getting HDU number for '$opts{extname}' extension in input event file '$infile'";
+
+#
+# create some common keywords that will be overwritten in the output headers
+#
+my $DATE;
+CFITSIO::fits_get_system_time($DATE,undef,$status);
+my $CREATOR = $0; $CREATOR =~ s/(.*\/)//;
+
+#
+# copy all HDUs before the event list
+#
+for (my $i=1; $i<$targethdu; $i++) {
+  _copy_hdu($infptr,$outfptr,$i,0) or
+    $infptr->close_file($status),
+      $outfptr->delete_file($status=0),
+	die "error copying HDU number $i from input event file '$infile' to output event file '$outfile'";
+}
+
+#
+# do time shifting
+#
+$infptr->movabs_hdu($targethdu,undef,$status);
+_time_shift($infptr, $outfptr) or
+  $infptr->close_file($status),
+  $outfptr->delete_file($status=0),
+  die "error filtering on PHA input event file '$infile' to output event file '$outfile'";
+
+#
+# copy all HDUs after the event list
+#
+for (my $i=$targethdu+1; $i<=$nhdus; $i++) {
+  _copy_hdu($infptr,$outfptr,$i,0) or
+    $infptr->close_file($status),
+      $outfptr->delete_file($status=0),
+	die "error copying HDU number $i from input event file '$infile' to output event file '$outfile'";
+}
+
+$infptr->close_file($status);
+$outfptr->close_file($status);
+
+exit 0;
+
+sub _time_shift($$) {
+  my ($infptr, $outfptr) = @_;
+
+  my $status = 0;
+
+  my $hdr = $infptr->read_header();
+
+  my (@ttype, @tform, @tunit, @tlmin, @tlmax,
+      @tcnam, @tctyp, @tcrvl, @tcrpx, @tcdlt,
+      %cols);
+  exists $hdr->{TFIELDS} or return;
+  my $j = 0;
+  for (my $i=1; $i<=$hdr->{TFIELDS}; $i++) {
+
+    my ($ttype,$tform) = ($hdr->{'TTYPE'.$i}, $hdr->{'TFORM'.$i});
+    my $tunit = exists $hdr->{'TUNIT'.$i} ? $hdr->{'TUNIT'.$i} : '' ;
+    my $tlmin = exists $hdr->{'TLMIN'.$i} ? $hdr->{'TLMIN'.$i} : undef ;
+    my $tlmax = exists $hdr->{'TLMAX'.$i} ? $hdr->{'TLMAX'.$i} : undef ;
+
+    my $tcnam = exists $hdr->{'TCNAM'.$i} ? $hdr->{'TCNAM'.$i} : undef ;
+    my $tctyp = exists $hdr->{'TCTYP'.$i} ? $hdr->{'TCTYP'.$i} : undef ;
+    my $tcrvl = exists $hdr->{'TCRVL'.$i} ? $hdr->{'TCRVL'.$i} : undef ;
+    my $tcrpx = exists $hdr->{'TCRPX'.$i} ? $hdr->{'TCRPX'.$i} : undef ;
+    my $tcdlt = exists $hdr->{'TCDLT'.$i} ? $hdr->{'TCDLT'.$i} : undef ;
+    defined($_) and s/^'(.*?)\s*?'/$1/ for ($ttype,$tform,$tunit,$tlmin,$tlmax);
+
+    push @ttype, lc $ttype;
+    push @tform, $tform;
+    push @tunit, $tunit;
+    push @tlmin, $tlmin;
+    push @tlmax, $tlmax;
+
+    push @tcnam, $tcnam;
+    push @tctyp, $tctyp;
+    push @tcrvl, $tcrvl;
+    push @tcrpx, $tcrpx;
+    push @tcdlt, $tcdlt;
+
+    $j++;
+    $cols{$ttype} = { tform => $tform, incolnum => $i, outcolnum => $j };
+  }
+
+  $outfptr->insert_btbl(0,scalar(@ttype),\@ttype,\@tform,\@tunit,$opts{extname},0,$status);
+  _check_status($status) or return;
+
+  # start by inserting all keys that we can
+  my $nkeys;
+  $infptr->get_hdrspace($nkeys, undef, $status);
+  my %key_types;
+  @key_types{ CFITSIO::TYP_NULL_KEY(),
+              CFITSIO::TYP_HDUID_KEY(),
+              CFITSIO::TYP_CKSUM_KEY(),
+              CFITSIO::TYP_WCS_KEY(),
+              CFITSIO::TYP_REFSYS_KEY(),
+              CFITSIO::TYP_COMM_KEY(),
+              CFITSIO::TYP_CONT_KEY(),
+              CFITSIO::TYP_USER_KEY()
+             } = ();
+  for (1..$nkeys) {
+    my $card;
+    $infptr->read_record($_, $card, $status);
+    my $type = CFITSIO::fits_get_keyclass($card);
+    $outfptr->write_record($card, $status) if exists $key_types{$type};
+  }
+  $outfptr->write_history("$0 $args",$status);
+
+  exists $cols{time} or carp("could not read TIME column");
+
+  my $nrows;
+  $infptr->get_num_rows($nrows,$status);
+  $opts{nrows} or $infptr->get_rowsize($opts{nrows}=0, $status);
+
+  $opts{nrows} = $nrows if ($opts{nrows} < 1 or $opts{nrows} > $nrows);
+
+  #
+  # set up piddles
+  #
+  my %datatypes = (
+		   'A' => { 'pdl' => undef, 'cfitsio' => CFITSIO::TSTRING(), },
+		   'I' => { 'pdl' => short, },
+		   'J' => { 'pdl' => long, },
+		   'E' => { 'pdl' => float, },
+		   'D' => { 'pdl' => double, },
+		   'X' => { 'pdl' => byte, 'cfitsio' => CFITSIO::TBIT(), },
+		  );
+
+  for my $dt (keys %datatypes) {
+    next if exists $datatypes{$dt}{'cfitsio'};
+    $datatypes{$dt}{'cfitsio'} = _match_datatype($datatypes{$dt}{'pdl'});
+    if ($datatypes{$dt}{'cfitsio'} == -1) {
+      carp("no matching CFITSIO datatype found for TFORM '$dt'");
+      return;
+    }
+  }
+
+  for my $ttype (@ttype) {
+    # repeat==0 not handled
+    my ($repeat, $type) = $cols{$ttype}{tform} =~ /^(\d*)([A-Z])$/ or
+      carp("unrecognized TFORM = '$cols{$ttype}{tform}'"),
+	return;
+    $cols{$ttype}{repeat} = $repeat ? $repeat : 1;
+    exists $datatypes{$type} or
+      carp("unrecognized TFORM = '$cols{$ttype}{tform}'"),
+	return;
+    if ($type eq 'A') {
+      $cols{$ttype}{'pdl'} = [];
+    } else {
+      $cols{$ttype}{'pdl'} = $repeat > 1 ?
+	zeroes($datatypes{$type}{'pdl'}, $repeat, $opts{nrows}) :
+	  zeroes($datatypes{$type}{'pdl'}, $opts{nrows})
+
+	}
+    $cols{$ttype}{cfitsio_datatype} = $datatypes{$type}{'cfitsio'};
+  }
+
+  print STDERR "Shifting events...    ";
+
+  my $old_packing = CFITSIO::PerlyUnpacking(-1);
+  CFITSIO::PerlyUnpacking(0);
+  my $rows_done = 0;
+
+  while (1) {
+
+    print STDERR (("\b"x4).sprintf(" %2d",int(100*$rows_done/$nrows)).'%');
+    my $i;
+
+    my $rows_this_time = $opts{nrows};
+    $rows_this_time = $nrows-$rows_done if ($rows_this_time > $nrows-$rows_done);
+
+    for my $ttype (@ttype) {
+
+      if ($cols{$ttype}{cfitsio_datatype} == CFITSIO::TSTRING()) {
+	$infptr->read_col($cols{$ttype}{cfitsio_datatype},
+			  $cols{$ttype}{incolnum},
+			  $rows_done+1, 1,
+			  $rows_this_time, '',
+			  $cols{$ttype}{'pdl'}, undef,
+			  $status);
+      } else {
+	$infptr->read_col($cols{$ttype}{cfitsio_datatype},
+			  $cols{$ttype}{incolnum},
+			  $rows_done+1, 1,
+			  $cols{$ttype}{repeat}*$rows_this_time, 0,
+			  ${$cols{$ttype}{'pdl'}->get_dataref},
+			  undef,$status);
+	$cols{$ttype}{'pdl'}->upd_data;
+      }
+      _check_status($status) or
+	carp("error reading from input event list"),
+	  return;
+
+      #
+      # write rows
+      #
+      if ($cols{$ttype}{cfitsio_datatype} == CFITSIO::TSTRING()) {
+	$outfptr->write_col($cols{$ttype}{cfitsio_datatype},
+			    $cols{$ttype}{outcolnum},
+			    $rows_done+1, 1,
+			    $rows_this_time-1,$cols{$ttype}{'pdl'},
+			    $status);
+      } else {
+	$outfptr->write_col($cols{$ttype}{cfitsio_datatype},
+			    $cols{$ttype}{outcolnum},
+			    $rows_done+1, 1,
+			    $cols{$ttype}{repeat}*($rows_this_time-1),
+			    $cols{$ttype}{'pdl'}->clump(-1)->slice($ttype eq 'time' ? '1:'.($cols{$ttype}{repeat}*($rows_this_time-1)) : '0:'.($cols{$ttype}{repeat}*($rows_this_time-1)-1))->get_dataref,
+			    $status);
+      }
+      _check_status($status) or
+	carp("error writing to output event list"),
+	  return;
+
+    }
+    $rows_done += $rows_this_time;
+    last if $rows_done >= $nrows;
+    $rows_done--;
+  }
+
+  print STDERR (("\b"x4).'100%');
+
+  print STDERR " done\n";
+
+  $outfptr->update_key(CFITSIO::TSTRING(),'CREATOR',$CREATOR,undef,$status);
+  $outfptr->update_key(CFITSIO::TSTRING(),'DATE',$DATE,undef,$status);
+  $outfptr->update_chksum($status);
+
+  CFITSIO::PerlyUnpacking($old_packing);
+
+  return 1;
+}
+
+# Returns number of HDUs in file, as well as HDU number of the
+# given extension=$target_hdunam.
+sub _get_hdu_nums($$) {
+  my ($fptr,$target_hdunam) = @_;
+
+  my $status = 0;
+  my $current_hdunum = $fptr->get_hdu_num(undef);
+
+  my $numhdus;
+  $fptr->get_num_hdus($numhdus,$status);
+
+  $fptr->movnam_hdu(CFITSIO::ANY_HDU(),$target_hdunam,0,$status);
+  my $target_hdunum = $fptr->get_hdu_num(undef);
+
+  $fptr->movabs_hdu($current_hdunum,undef,$status);
+
+  _check_status($status) or return;
+
+  return($numhdus,$target_hdunum);
+}
+
+# Copies HDU number $hdunum from $infptr to $outfptr.
+# $return_to_old_hdu is a boolean flag indicating whether
+# $infptr should be repositioned to it's pre-called HDU
+# number prior to returning.
+sub _copy_hdu($$$$) {
+  my ($infptr,$outfptr,$hdunum,$return_to_old_hdu) = @_;
+
+  my $status = 0;
+
+  my $old_hdu_num = $infptr->get_hdu_num(undef);
+  $infptr->movabs_hdu($hdunum,undef,$status);
+  $infptr->copy_hdu($outfptr,0,$status);
+  $outfptr->update_key(CFITSIO::TSTRING(),'CREATOR',$CREATOR,undef,$status);
+  $outfptr->update_key(CFITSIO::TSTRING(),'DATE',$DATE,undef,$status);
+  $outfptr->update_chksum($status);
+  $infptr->movabs_hdu($old_hdu_num) if $return_to_old_hdu;
+  _check_status($status) or return;
+
+  return 1;
+}
+
+sub _open_input_file($) {
+  my $file = shift;
+  my $status = 0;
+  my $fptr = CFITSIO::open_file($file,CFITSIO::READONLY(),$status);
+  _check_status($status) or return;
+  return $fptr;
+}
+
+sub _open_output_file($) {
+  my $file = shift;
+  my $status = 0;
+  substr($file,0,1) eq '!' or $file = '!'.$file;
+  my $fptr = CFITSIO::create_file($file,$status);
+  _check_status($status) or return;
+  return $fptr;
+}
+
+# Check CFITSIO status.
+sub _check_status($) {
+  my $status = shift;
+  if ($status != 0) {
+    my $txt;
+    CFITSIO::fits_get_errstatus($status,$txt);
+    print STDERR "CFITSIO error detected: $txt\n";
+    return 0;
+  }
+
+  return 1;
+}
+
+sub _version {
+  print "$0, version $VERSION\n";
+  exit 0;
+}
+
+sub help {
+  print <<EOP;
+Usage: $0 [options] infile outfile
+
+  Events are shifted to correspond to the next event's timestamp. The
+  output file, coincidentally, has one fewer event than the input file.
+
+  Options:
+  --help        This message.
+  --version     Print version information.
+  --extname     Name of extension containing events, default is '$default_opts{extname}'.
+  --nrows       Number of events to process at a time.
+                The default should suffice.
+
+  AUTHOR:
+    Pete Ratzlaff <pratzlaff\@cfa.harvard.edu>
+
+EOP
+
+  exit 0;
+}
+
+#
+# find appropriate CFITSIO datatype for a given piddle type.
+# Can be passed the piddle itself or a PDL::Type token (e.g.,
+# float() with no args).
+#
+sub _match_datatype {
+  my $arg = shift;
+
+  my $invalid_cfitsio_type = -1;
+
+  my $pdl_type;
+  if (UNIVERSAL::isa($arg,'PDL')) {
+    $pdl_type = $arg->get_datatype;
+  } else {
+    $pdl_type = $arg->[0];
+  }
+
+  my $pdl_size = PDL::Core::howbig($pdl_type);
+
+  my @cfitsio_possible_types;
+  # test for real datatypes
+  if ($pdl_type == float(1)->get_datatype or
+      $pdl_type == double(1)->get_datatype
+     ) {
+    @cfitsio_possible_types = (
+			       CFITSIO::TDOUBLE(),
+			       CFITSIO::TFLOAT(),
+			      );
+  } elsif ($pdl_type == short(1)->get_datatype or
+	   $pdl_type == long(1)->get_datatype
+	  ) {
+    @cfitsio_possible_types = (
+			       CFITSIO::TSHORT(),
+			       CFITSIO::TINT(),
+			       CFITSIO::TLONG(),
+			      );
+  } elsif ($pdl_type == ushort(1)->get_datatype or
+	   $pdl_type == byte(1)->get_datatype
+	  ) {
+    @cfitsio_possible_types = (
+			       CFITSIO::TBYTE(),
+			       CFITSIO::TUSHORT(),
+			       CFITSIO::TUINT(),
+			       CFITSIO::TULONG(),
+			      );
+  }
+
+  $pdl_size == CFITSIO::sizeof_datatype($_) and return $_ for @cfitsio_possible_types;
+
+  return $invalid_cfitsio_type;
+}

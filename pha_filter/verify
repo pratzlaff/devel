@@ -1,0 +1,113 @@
+#! /usr/bin/perl -w
+use strict;
+
+use lib '/home/rpete/local/perlmods';
+
+use PDL;
+use Chandra::Tools::Common;
+use Carp;
+use Getopt::Long;
+
+my $VERSION = '0.1';
+
+my %opts = ();
+GetOptions(\%opts,
+	   'help!', 'version!',
+	   ) or die "Try \`$0 --help\' for more information.\n";
+$opts{help} and help();
+$opts{version} and version();
+
+@ARGV == 3 or
+    die "$0: invalid arguments\nTry \`$0 --help\' for more information.\n";
+
+my ($infile,$outfile,$filterfile) = (shift,shift,shift);
+
+my ($u,$v,$pha_low,$pha_high) = read_bintbl_cols($filterfile,'lab_u','lab_v','pha_low','pha_high',
+						 {extname => 'phalim'});
+defined $u or confess "error reading filter file '$filterfile'";
+
+my ($inrawx,$inrawy,$inpha,$instatus) = read_bintbl_cols($infile,'rawx','rawy','pha','status',
+							 {extname => 'events'});
+defined $inrawx or confess "error reading input file '$infile'";
+
+my ($outrawx,$outrawy,$outpha,$outstatus) = read_bintbl_cols($outfile,'rawx','rawy','pha','status',
+							 {extname => 'events'});
+defined $inrawx or confess "error reading input file '$infile'";
+
+for (my $i=0; $i<$u->nelem; $i++) {
+    my ($this_u, $this_v, $this_pha_low, $this_pha_high) =
+	($u->at($i), $v->at($i), $pha_low->at($i), $pha_high->at($i));
+
+    my $in_range_index = which(
+			       $inrawx >= 128*($this_u-1) & $inrawx <= 128*$this_u-1 &
+			       $inrawy >= 128*($this_v-1) & $inrawy <= 128*$this_v-1
+			       );
+
+    my $out_range_index = which(
+				$outrawx >= 128*($this_u-1) & $outrawx <= 128*$this_u-1 &
+				$outrawy >= 128*($this_v-1) & $outrawy <= 128*$this_v-1
+				);
+
+    my $in_good_index = $in_range_index->index(which(
+						     $inpha->index($in_range_index) >= $this_pha_low &
+						     $inpha->index($in_range_index) <= $this_pha_high
+						     )
+					       ); 
+    if ($in_good_index->nelem == 0) {
+	print "U = $this_u, V = $this_v, PHA_LOW = $this_pha_low, PHA_HIGH = $this_pha_high...no data\n";
+	next;
+    }
+
+    my $out_good_index = $out_range_index->index(which(
+						       $outpha->index($out_range_index) >= $this_pha_low &
+						       $outpha->index($out_range_index) <= $this_pha_high
+						       )
+						 );
+
+    #
+    # Tests:
+    #
+    # Number of good events in input and output files must be the same.
+    # The parameters of those events (rawx/y, pha, status) must be identical.
+    #
+    my $n1 = ($instatus->dims)[0];
+    if ($in_good_index->nelem == $out_good_index->nelem &&
+	abs($inrawx->index($in_good_index)-$outrawx->index($out_good_index))->max == 0 &&
+	abs($inrawy->index($in_good_index)-$outrawy->index($out_good_index))->max == 0 &&
+	abs($inpha->index($in_good_index)-$outpha->index($out_good_index))->max == 0 &&
+	abs(
+	    $instatus->clump(-1)->index($in_good_index->dummy(0,$n1)*$n1 + sequence($n1))->clump(-1) -
+	    $outstatus->clump(-1)->index($out_good_index->dummy(0,$n1)*$n1 + sequence($n1))->clump(-1)
+	    )->max == 0
+	) {
+	print "U = $this_u, V = $this_v, PHA_LOW = $this_pha_low, PHA_HIGH = $this_pha_high...passed\n";
+    }
+    else {
+	print "U = $this_u, V = $this_v, PHA_LOW = $this_pha_low, PHA_HIGH = $this_pha_high...failed\n";
+    }
+}
+
+exit 0;
+
+
+sub version {
+    print "$0, version $VERSION\n";
+    exit 0;
+}
+
+sub help {
+
+    print <<EOP;
+Usage: $0 [options] infile outfile filterfile
+
+  Options:
+  --help           show help and exit
+  --version        show version information and exit
+
+  Author:
+    Pete Ratzlaff <pratzlaff\@cfa.harvard.edu>
+
+EOP
+
+    exit 0;
+}

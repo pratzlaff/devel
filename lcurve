@@ -1,0 +1,975 @@
+#! /usr/bin/perl -w
+use strict;
+
+use FindBin;
+use Config;
+use lib '/home/rpete/local/perlmods';
+use lib '/home/rpete/local/perlmods/'.$Config{archname};
+
+BEGIN { $^W =0;  }
+$^W = 1;
+use PDL;
+#use PDL::Graphics::PGPLOT;
+use PGPLOT;
+use Chandra::Tools::Common qw( read_bintbl_cols check_status );
+use Astro::WCS::LibWCS;
+use Getopt::Long;
+use Carp;
+use Astro::FITS::CFITSIO;
+use Math::Trig qw( pi );
+use Chandra::Constants qw( DEG_PER_RAD );
+
+my @argv_save = @ARGV;
+
+# define viewport coordinates of corners in normalized device coords
+my %pcoords = (
+	       "1x2" => {
+			 xleft => [0.1, 0.1],
+			 xright => [0.9, 0.9],
+			 ytop => [0.9, 0.4],
+			 ybottom => [0.6, 0.1],
+			},
+	       "2x2" => {
+			 xleft => [0.1, 0.6, 0.1, 0.6],
+			 xright => [0.4, 0.9, 0.4, 0.9],
+			 ytop => [0.9, 0.9, 0.4, 0.4],
+			 ybottom => [0.6, 0.6, 0.1, 0.1],
+			},
+	      );
+
+my $VERSION = '0.1';
+
+=begin comment
+
+$PDL::Graphics::PGPLOT::AXISCOLOUR = 1;
+$PDL::Graphics::PGPLOT::HARD_LW = 1;
+$PDL::Graphics::PGPLOT::HARD_CH = 1;
+$PDL::Graphics::PGPLOT::HARD_FONT = 1;
+
+=cut
+
+my $target_energy = 1.0; # keV, used in PSF lookup
+my $um_per_deg = 150600;
+my $um_per_pixel = 6.43;
+my $pixel_per_deg = $um_per_deg / $um_per_pixel;
+my $tmp;
+
+my %default_opts = (
+		    timebin => 100,
+		    outbase => './lcurve',
+		    rdb => 1,
+		    eefactor => 5,
+		    truncate => 0,
+		    extname => 'events',
+		    bgratio => 10,
+		    gti => 1,
+		    chipplot => 0,
+		    );
+my %opts = %default_opts;
+GetOptions(\%opts,
+	   'cellfile=s', 'cellrows=s', 'extname=s', 'timebin=f', 'xy=s@',
+	   'rfilter=s', 'outbase=s', 'eefactor=f', 'dtffile=s',
+	   'psffile=s', 'gtifile=s', 'truncate=f', 'bgratio=f',
+	   'help!', 'rdb!', 'version!', 'gti!', 'chipplot!',
+	   ) or die "Try `$0 --help' for more information\n";
+$opts{help} and help();
+$opts{version} and version();
+
+@ARGV == 1 or
+  die "$0: missing file argument\nTry `$0 --help' for more information\n";
+my $fitsfile = shift;
+my $fptr;
+my $status=0;
+
+#
+# find psffile
+#
+
+$opts{psffile} = _find_psf_file();
+print STDERR "Using PSF size file '$opts{psffile}'\n";
+
+#
+# read GTI
+#
+my ($gti_start,$gti_stop);
+
+if ($opts{gti}) {
+
+  if ($opts{gtifile}) {
+    print STDERR "Reading GTI from $opts{gtifile}...";
+    print STDERR " done\n" if
+      ($gti_start, $gti_stop) = _read_gti($opts{gtifile});
+  }
+
+  if (!defined $gti_start) {
+    print STDERR "Reading GTI from $fitsfile...";
+    $fptr = Astro::FITS::CFITSIO::open_file($fitsfile,Astro::FITS::CFITSIO::READONLY(),$status);
+    check_status($status) or
+      _error("could not open events FITS file '$fitsfile'");
+    print STDERR " done\n" if ($gti_start,$gti_stop) = _read_gti($fptr);
+  }
+
+  # both attempts failed
+  if (!defined $gti_start) {
+    _logit("error reading GTI list, using all events");
+  }
+
+  # GTI list has no data
+  elsif (!$gti_start->nelem) {
+    _logit("empty GTI list, using all events");
+    $gti_start = $gti_stop = undef;
+  }
+
+} else {
+  _logit("no GTI list requested, using all events");
+}
+
+#
+# read deadtime correction factors
+#
+# FIXME: need to incorporate DTF_ERR as well
+#
+my ($dtf_time, $dtf, $dtf_err);
+if ($opts{dtffile}) {
+  print STDERR "Reading deadtime factors from '$opts{dtffile}'...";
+  ($dtf_time,$dtf,$dtf_err) = read_bintbl_cols($opts{dtffile},'time','dtf','dtf_err',{extname=>'dtf',status=>1, dtypes => { dtf =>float, dtf_err=>float, },}) or
+    _error("error reading dtf file $opts{dtffile}");
+  print STDERR "\n";
+}
+
+# open events file, move to events hdu
+if (!$fptr) {
+  $fptr = Astro::FITS::CFITSIO::open_file($fitsfile,Astro::FITS::CFITSIO::READONLY(),$status);
+  check_status($status) or
+    _error("could not open events FITS file '$fitsfile'");
+}
+$fptr->movnam_hdu(Astro::FITS::CFITSIO::BINARY_TBL(),$opts{extname},0,$status);
+check_status($status) or
+  _error("could not move to extension '$opts{extname}'");
+
+my $hdr;
+($hdr, $status) = $fptr->read_header;
+check_status($status) or
+  _error("error reading events header");
+
+#
+# obtain source regions
+#
+my ($ra_reg,$dec_reg,$x_reg,$y_reg) = get_regions($fptr) or
+  _error("could not obtain source regions");
+
+# $psf_offaxis are in arcsec, $psf_tables are the tables in the header
+# of the PSF file.
+my ($psf_offaxis,$psf_tables) = get_psf_tables($opts{psffile},$hdr);
+
+# determine offaxis values
+my ($ra_nom, $dec_nom) = ($hdr->{RA_NOM}, $hdr->{DEC_NOM});
+_logit(sprintf "RA_NOM = %.5f",$ra_nom);
+_logit(sprintf "DEC_NOM = %.5f",$dec_nom);
+# @offaxis and @radii are in arcsec
+my @offaxis = (sqrt((($ra_reg-$ra_nom)*cos($dec_nom/DEG_PER_RAD))**2 + ($dec_reg-$dec_nom)**2)*3600.0)->list;
+my @radii = get_psfs(\@offaxis,$opts{psffile},$psf_offaxis,$psf_tables);
+_logit("radii (arcsec) = ".(join(', ', map(sprintf("%d",$_), @radii))));
+my @radii_pix = map { $_ / 3600.0 * $pixel_per_deg } @radii;
+_logit("radii (pixel) = ".(join(', ', map(sprintf("%.1f",$_), @radii_pix))));
+
+# annulii radii are in pixels
+my @annulii_inner = @radii_pix;
+my @annulii_outer = map { sqrt($opts{bgratio} * $radii_pix[$_]**2 + $annulii_inner[$_]**2) } (0..$#radii_pix);
+
+# read data
+my $rfilter = join(' || ',map("circle(".(sprintf "%.1f",$x_reg->dims ? $x_reg->at($_) : $x_reg->at).', '.(sprintf "%.1f", $y_reg->dims>=1 ? $y_reg->at($_) : $y_reg->at).', '.(sprintf "%.1f",$annulii_outer[$_]).', x ,y)', (0..$#radii)));
+if (defined $opts{rfilter} and length $opts{rfilter}) {
+    $rfilter = "$opts{rfilter} && ( $rfilter )";
+}
+_logit("rfilter = '$rfilter'");
+print STDERR "Reading data...";
+my ($time,$x,$y,$chipx,$chipy) = read_bintbl_cols($fptr,'time','x','y',
+						  ($opts{chipplot} ? qw(chipx chipy) : ()),
+						  {status=>1,rfilter=>$rfilter, dtypes => { x=>float, y=>float, chipx=>float, chipy=>float, }, }) or
+  _error("error reading FITS data file '$fitsfile'");
+print STDERR " done\n";
+
+$fptr->close_file($status);
+
+#
+# default GTI
+#
+if (!defined $gti_start) {
+  $gti_start = pdl [ $time->min ];
+  $gti_stop = pdl [ $time->max ];
+}
+
+#
+# modify GTI to include truncation
+#
+my $tstart = $gti_start->at(0);
+my $tstop = $gti_stop->at(-1);
+
+# gti to keep
+my $index = which(
+		  $gti_stop-$gti_start->at(0) > $opts{truncate} &
+		  $gti_stop->at(-1) - $gti_start > $opts{truncate}
+		  );
+$index->nelem or _error("empty GTI list after truncation");
+$gti_start = $gti_start->index($index)->sever;
+$gti_stop = $gti_stop->index($index)->sever;
+
+# gti to modify
+$index = which($gti_start < $tstart+$opts{truncate});
+$index->nelem and
+  ($tmp = $gti_start->index($index)) .= $tstart + $opts{truncate};
+
+$index = which($gti_stop > $tstop-$opts{truncate});
+$index->nelem and
+  ($tmp = $gti_stop->index($index)) .= $tstop - $opts{truncate};
+
+$tstart = $gti_start->at(0);
+$tstop = $gti_stop->at(-1);
+
+#
+# get the good time for each timebin
+#
+my ($timebin_values,$jnk) = hist pdl([0]), $tstart, $tstop+$opts{timebin}, $opts{timebin};
+my $timebin_sizes = zeroes($timebin_values->nelem);
+for (my $i=0; $i<$timebin_sizes->nelem; $i++) {
+  $timebin_sizes->set($i, 
+		      Chandra::Tools::Common::good_time(
+							$timebin_values->at($i)-$opts{timebin}/2,
+							$timebin_values->at($i)+$opts{timebin}/2,
+							$gti_start, $gti_stop
+						       )
+		     );
+}
+my $timebin_mask = which($timebin_sizes > 0);
+$timebin_mask->nelem or
+  _error("all time bins zero size");
+my $timebin_values_good = $timebin_values->index($timebin_mask);
+my $timebin_sizes_good = $timebin_sizes->index($timebin_mask);
+
+#
+# save only events during good times
+#
+my $gti_mask = Chandra::Tools::Common::good_time_mask($time,$gti_start,$gti_stop);
+$gti_mask->nelem or
+  _error("no good event times");
+$time = $time->index(which($gti_mask))->sever;
+$x = $x->index(which($gti_mask))->sever;
+$y = $y->index(which($gti_mask))->sever;
+
+#
+# now for each source, make the light curves
+#
+for (my $i=0; $i<@radii_pix; $i++) {
+    my $radius = $radii_pix[$i];
+    my $source_area = $radius**2 * pi;
+    my $annulus_inner = $annulii_inner[$i];
+    my $annulus_outer = $annulii_outer[$i];
+    my $bg_area = ($annulus_outer**2 - $annulus_inner**2) * pi;
+    my $area_ratio = $bg_area/$source_area;
+    my $xcen = $x_reg->dims ? $x_reg->at($i) : $x_reg->at;
+    my $ycen = $y_reg->dims ? $y_reg->at($i) : $y_reg->at;
+
+    print STDERR <<EOP;
+# Processing source ${\($i+1)}/${\(scalar @radii_pix)}
+#    X centroid = ${\(sprintf "%.1f",$xcen)}
+#    Y centroid = ${\(sprintf "%.1f",$ycen)}
+#    Source radius = ${\(sprintf "%.1f",$radius)}
+#    Inner background radius = ${\(sprintf "%.1f",$annulus_inner)}
+#    Outer background radius = ${\(sprintf "%.1f",$annulus_outer)}
+#    Source area = ${\(sprintf "%.1f",$source_area)}
+#    Background area = ${\(sprintf "%.1f",$bg_area)}
+#    Area ratio = ${\(sprintf "%.1f",$area_ratio)}
+EOP
+
+    pgopen($opts{outbase}."_visuals_${\($i+1)}.ps/cps") > 0 or die;
+#    dev $opts{outbase}."_visuals_${\($i+1)}.ps/cps";
+
+    my $dist_sqr = ($x-$xcen)**2 + ($y-$ycen)**2;
+    my $src_index = which( $dist_sqr < $radius**2);
+    my $bg_index = which( $dist_sqr > $annulus_inner**2 & $dist_sqr < $annulus_outer**2);
+
+    my $src_x = $x->index($src_index);
+    my $src_y = $y->index($src_index);
+    my $src_times = $time->index($src_index);
+
+    my $bg_x = $x->index($bg_index);
+    my $bg_y = $y->index($bg_index);
+    my $bg_times = $time->index($bg_index);
+
+    my $src_hist = hist $src_times, $tstart, $tstop+$opts{timebin}, $opts{timebin};
+    my $bg_hist = hist $bg_times, $tstart, $tstop+$opts{timebin}, $opts{timebin};
+
+    # keep only values with non-zero timebins
+    $src_hist = $src_hist->index($timebin_mask)->sever;
+    $bg_hist = $bg_hist->index($timebin_mask)->sever;
+
+    my $src_sigma = sqrt($src_hist);
+    my $bg_sigma = sqrt($bg_hist);
+
+    #
+    # normalize background rates to size of source region
+    #
+    if ($area_ratio) {
+	$bg_hist /= $area_ratio;
+	$bg_sigma /= $area_ratio;
+    }
+
+    my $lc_hist = ($src_hist - $bg_hist)/$timebin_sizes_good;
+    my $lc_sigma = sqrt($src_sigma**2 + $bg_sigma**2)/$timebin_sizes_good;
+
+    print STDERR '#    Events in source region: '.($src_times->nelem)."\n";
+    print STDERR '#    Events in background region: '.($bg_times->nelem)."\n";
+
+    # create mean dtf bins
+    my $dtf_hist = ones($timebin_values_good->nelem); # unity correction to start
+    my $dtf_sigma = zeroes($timebin_values_good->nelem);
+    if (defined $opts{dtffile}) {
+	for (my $i=0; $i<$dtf_hist->nelem; $i++) {
+	    my $index = which(
+			      $dtf_time >= $timebin_values_good->at($i)-$opts{timebin}/2 &
+			      $dtf_time < $timebin_values_good->at($i)+$opts{timebin}/2
+			      );
+	    $index->nelem or do {
+		printf STDERR "No deadtime corrections for time = %d +/- %d\n",
+		$timebin_values_good->at($i),$opts{timebin}/2;
+		next;
+	    };
+	    my $mean_dtf = $dtf->index($index)->sum / $index->nelem;
+	    $dtf_hist->set($i,$mean_dtf);
+	    $dtf_sigma->set($i,sqrt((($dtf_err->index($index))**2)->sum));
+	}
+    }
+
+    # total exposure time used, compound dtf
+    my $exposure = $timebin_sizes_good->sum;
+    my $compound_dtf = ($timebin_sizes_good * $dtf_hist)->sum / $exposure;
+
+    #
+    # final light curve
+    #
+    my $lc_final_hist = $lc_hist/$dtf_hist;
+    my $lc_final_sigma = sqrt(
+			      ($lc_sigma / $dtf_hist)**2 +
+			      ($lc_hist * $dtf_sigma / $dtf_hist**2)**2
+			      );
+
+    #
+    # prepare to plot
+    #
+    pgsci(1);
+
+    my ($xlow,$xhigh,$ylow,$yhigh,$ystretch);
+    my ($xtitle,$ytitle,$title);
+
+    my $xadd = -$tstart;
+
+    $xlow = $tstart + $xadd;
+    $xhigh = $tstop + $xadd + $opts{timebin} / 2;
+    $xtitle = "time \\fiks\\fn (binsize=$opts{timebin} \\fis\\fn) ".(sprintf "%.1f",$xadd/1000).' \fiks\fn offset';
+    my $time_plot_values = (($timebin_values_good+$xadd)/1000)->float;
+
+    #
+    # final light curve
+    #
+    $title = 'background-subtracted, deadtime-corrected';
+    $ytitle = 'events/second';
+    $ylow = ($lc_final_hist-$lc_final_sigma)->min > 0 ? 0 : ($lc_final_hist-$lc_final_sigma)->min;
+    $yhigh = ($lc_final_hist+$lc_final_sigma)->max;
+    $ystretch = ($yhigh != $ylow ? ($yhigh-$ylow)*0.1 : 0.01);
+    $ylow -= $ystretch;
+    $yhigh += $ystretch;
+    pgsvp($pcoords{'1x2'}{xleft}[0],$pcoords{'1x2'}{xright}[0],$pcoords{'1x2'}{ybottom}[0],$pcoords{'1x2'}{ytop}[0]);
+    pgswin($xlow/1000,$xhigh/1000,$ylow,$yhigh);
+    pgbox('BCNST', 0, 0, 'BCNST', 0, 0);
+    pgpt($time_plot_values->nelem,
+	 $time_plot_values->float->get_dataref,
+	 $lc_final_hist->float->get_dataref,
+	 17
+	 );
+    pgerry($time_plot_values->nelem,
+	   $time_plot_values->float->get_dataref,
+	   ($lc_final_hist+$lc_final_sigma)->float->get_dataref,
+	   ($lc_final_hist-$lc_final_sigma)->float->get_dataref,
+	   1);
+    pglab('',$ytitle,$title);
+
+    #
+    # final light curve, non-deadtime-corrected
+    #
+    $title = 'background-subtracted';
+    $ytitle = 'events/second';
+    $ylow = ($lc_hist-$lc_sigma)->min > 0 ? 0 : ($lc_hist-$lc_sigma)->min;
+    $yhigh = ($lc_hist+$lc_sigma)->max;
+    $ystretch = ($yhigh != $ylow ? ($yhigh-$ylow)*0.1 : 0.01);
+    $ylow -= $ystretch;
+    $yhigh += $ystretch;
+    pgsvp($pcoords{'1x2'}{xleft}[1],$pcoords{'1x2'}{xright}[1],$pcoords{'1x2'}{ybottom}[1],$pcoords{'1x2'}{ytop}[1]);
+    pgswin($xlow/1000,$xhigh/1000,$ylow,$yhigh);
+    pgbox('BCNST', 0, 0, 'BCNST', 0, 0);
+    pgpt($time_plot_values->nelem,
+	 $time_plot_values->float->get_dataref,
+	 $lc_hist->float->get_dataref,
+	 17);
+    pgerry($time_plot_values->nelem,
+	   $time_plot_values->float->get_dataref,
+	   ($lc_hist+$lc_sigma)->float->get_dataref,
+	   ($lc_hist-$lc_sigma)->float->get_dataref,
+	   1);
+    pglab($xtitle,$ytitle,$title);
+
+    #
+    # source region
+    #
+    pgpage();
+    $title = 'source region';
+    $ytitle = 'events';
+    $ylow = ($src_hist-$src_sigma)->min > 0 ? 0 : ($src_hist-$src_sigma)->min;
+    $yhigh = ($src_hist+$src_sigma)->max;
+    $ystretch = ($yhigh != $ylow ? ($yhigh-$ylow)*0.1 : 0.01);
+    $ylow -= $ystretch;
+    $yhigh += $ystretch;
+    pgsvp($pcoords{'2x2'}{xleft}[0],$pcoords{'2x2'}{xright}[0],$pcoords{'2x2'}{ybottom}[0],$pcoords{'2x2'}{ytop}[0]);
+    pgswin($xlow/1000,$xhigh/1000,$ylow,$yhigh);
+    pgbox('BCNST', 0, 0, 'BCNST', 0, 0);
+    pgpt($time_plot_values->nelem,
+	 $time_plot_values->float->get_dataref,
+	 $src_hist->float->get_dataref,
+	 17);
+    pgerry($time_plot_values->nelem,
+	   $time_plot_values->float->get_dataref,
+	   ($src_hist+$src_sigma)->float->get_dataref,
+	   ($src_hist-$src_sigma)->float->get_dataref,
+	   1);
+    pglab('',$ytitle,$title);
+
+    # plot background region
+    $title = 'background region, renormalized';
+    $ytitle = 'events';
+    $ylow = ($bg_hist-$bg_sigma)->min > 0 ? 0 : ($bg_hist-$bg_sigma)->min;
+    $yhigh = ($bg_hist+$bg_sigma)->max;
+    $ystretch = ($yhigh != $ylow ? ($yhigh-$ylow)*0.1 : 0.01);
+    $ylow -= $ystretch;
+    $yhigh += $ystretch;
+    pgsvp($pcoords{'2x2'}{xleft}[1],$pcoords{'2x2'}{xright}[1],$pcoords{'2x2'}{ybottom}[1],$pcoords{'2x2'}{ytop}[1]);
+    pgswin($xlow/1000,$xhigh/1000,$ylow,$yhigh);
+    pgbox('BCNST', 0, 0, 'BCNST', 0, 0);
+    pgpt($time_plot_values->nelem,
+	 $time_plot_values->get_dataref,
+	 $bg_hist->float->get_dataref,17
+	 );
+    pgerry($time_plot_values->nelem,
+	   $time_plot_values->float->get_dataref,
+	   ($bg_hist+$bg_sigma)->float->get_dataref,
+	   ($bg_hist-$bg_sigma)->float->get_dataref,
+	   1);
+    pglab('',$ytitle,$title);
+
+    #
+    # deadtime corrections
+    #
+    $title = 'deadtime factor';
+    $ytitle = 'dtf';
+    $ylow = ($dtf_hist-$dtf_sigma)->min > 0 ? 0 : ($dtf_hist-$dtf_sigma)->min;
+    $yhigh = ($dtf_hist+$dtf_sigma)->max;
+
+    ($ylow, $yhigh) = (0, 1);
+
+    $ystretch = ($yhigh != $ylow ? ($yhigh-$ylow)*0.1 : 0.01);
+    $ylow -= $ystretch;
+    $yhigh += $ystretch;
+    pgsvp($pcoords{'2x2'}{xleft}[2],$pcoords{'2x2'}{xright}[2],$pcoords{'2x2'}{ybottom}[2],$pcoords{'2x2'}{ytop}[2]);
+    pgswin($xlow/1000,$xhigh/1000,$ylow,$yhigh);
+    pgbox('BCNST', 0, 0, 'BCNST', 0, 0);
+    pgpt($time_plot_values->nelem,
+	 $time_plot_values->float->get_dataref,
+	 $dtf_hist->float->get_dataref,
+	 17);
+    pgerry($time_plot_values->nelem,
+	   $time_plot_values->float->get_dataref,
+	   ($dtf_hist+$dtf_sigma)->float->get_dataref,
+	   ($dtf_hist-$dtf_sigma)->float->get_dataref,
+	   1);
+    pglab($xtitle,$ytitle,$title);
+
+    #
+    # timebin sizes
+    #
+    $title = 'goodtime sizes';
+    $ytitle = 'time';
+    $ylow = $timebin_sizes_good->min > 0 ? 0 : $timebin_sizes_good->min;
+    $yhigh = $timebin_sizes_good->max;
+    $ystretch = ($yhigh != $ylow ? ($yhigh-$ylow)*0.1 : 0.01);
+    $ylow -= $ystretch;
+    $yhigh += $ystretch;
+    pgsvp($pcoords{'2x2'}{xleft}[3],$pcoords{'2x2'}{xright}[3],$pcoords{'2x2'}{ybottom}[3],$pcoords{'2x2'}{ytop}[3]);
+    pgswin($xlow/1000,$xhigh/1000,$ylow,$yhigh);
+    pgbox('BCNST', 0, 0, 'BCNST', 0, 0);
+    pgpt($time_plot_values->nelem,
+	 $time_plot_values->float->get_dataref,
+	 $timebin_sizes_good->float->get_dataref,
+	 17);
+    pglab($xtitle,$ytitle,$title);
+
+    my $image;
+    my $npix = 512;
+    my ($xmin,$xinc,$ymin,$yinc);
+
+    # plot all events
+    ($xmin,$xinc) = ($xcen-$annulus_outer, 2*$annulus_outer/$npix); 
+    ($ymin,$yinc) = ($ycen-$annulus_outer, 2*$annulus_outer/$npix);
+#    my $all_index = which($x>$xmin & $x<$xmin+$xinc*$npix & $y>$ymin & $y<$ymin+$yinc*$npix);
+#    my $all_index = which($x>$xmin & $x<$xcen+$annulus_outer & $y>$ymin & $y<$ycen+$annulus_outer);
+    $image = histogram2d(append($src_x,$bg_x),append($src_y,$bg_y),
+			 $xinc,$xmin,$npix,
+			 $yinc,$ymin,$npix,
+			 );
+    pgenv($xmin,$xmin+$xinc*$npix,$ymin,$ymin+$yinc*$npix,0,0);
+    pggray($image->float->get_dataref,$image->dims,
+	   1,($image->dims)[0], 1, ($image->dims)[1],
+	   0,1,(float [$xmin,$xinc,0,$ymin,0,$yinc])->get_dataref);
+#    imag $image, 0, 1, float [$xmin,$xinc,0,$ymin,0,$yinc];
+    pglab('x','y','source and background regions');
+
+    pgsfs(2);
+    pgsci(2);
+    pgcirc($xcen,$ycen,$radius); # source region
+    pgsls(2);
+    pgcirc($xcen,$ycen,$annulus_inner); # inner radius of background region
+    pgsls(3);
+    pgcirc($xcen,$ycen,$annulus_outer); # outer radius of background region
+
+    pgsls(1);
+    pgsfs(1);
+    pgsci(1);
+
+    # plot source events
+    ($xmin,$xinc) = ($xcen-$radius, 2*$radius/$npix); 
+    ($ymin,$yinc) = ($ycen-$radius, 2*$radius/$npix);
+
+			 $image = histogram2d($src_x, $src_y,
+			 $xinc,$xmin,$npix,
+			 $yinc,$ymin,$npix,
+			 );
+
+#    imag $image, 0, 1, float [$xmin,$xinc,0,$ymin,0,$yinc];
+    pgenv($xmin,$xmin+$xinc*$npix,$ymin,$ymin+$yinc*$npix,0,0);
+    pggray($image->float->get_dataref,$image->dims,
+	   1,($image->dims)[0], 1, ($image->dims)[1],
+	   0,1,(float [$xmin,$xinc,0,$ymin,0,$yinc])->get_dataref);
+    pglab('x','y','source region');
+    pgpage();
+
+    # plot data events
+    ($xmin,$xinc) = ($xcen-$annulus_outer, 2*$annulus_outer/$npix); 
+    ($ymin,$yinc) = ($ycen-$annulus_outer, 2*$annulus_outer/$npix);
+    $image = histogram2d($bg_x, $bg_y,
+			 $xinc,$xmin,$npix,
+			 $yinc,$ymin,$npix,
+			 );
+#    imag $image, 0, 1, float [$xmin,$xinc,0,$ymin,0,$yinc];
+    pgenv($xmin,$xmin+$xinc*$npix,$ymin,$ymin+$yinc*$npix,0,0);
+    pggray($image->float->get_dataref,$image->dims,
+	   1,($image->dims)[0], 1, ($image->dims)[1],
+	   0,1,(float [$xmin,$xinc,0,$ymin,0,$yinc])->get_dataref);
+    pglab('x','y','background region');
+
+    # plot chip coords
+    if ($opts{chipplot}) {
+      ($xmin,$xinc) = ($chipy->min, ($chipy->max-$chipy->min)/$npix);
+      ($ymin,$yinc) = ($chipx->min, ($chipx->max-$chipx->min)/$npix);
+      $image = histogram2d($chipy, $chipx,
+			   $xinc,$xmin,$npix,
+			   $yinc,$ymin,$npix,
+			  );
+#      imag $image, 0, 1, float [$xmin,$xinc,0,$ymin,0,$yinc];
+      pgenv($xmin,$xmin+$xinc*$npix,$ymin,$ymin+$yinc*$npix,0,0);
+      pggray($image->float->get_dataref,$image->dims,
+	     1,($image->dims)[0], 1, ($image->dims)[1],
+	     0,1,(float [$xmin,$xinc,0,$ymin,0,$yinc])->get_dataref);
+      pglab('CHIPY','CHIPX','CHIP coords');
+      pgsci(4);
+      pgsfs(3);
+      pgpoly(4,[0,0,6333,6333],[0,2672,2672,0]);
+      pgpoly(4,[11216,11216,16384,16384],[0,2672,2672,0]);
+      pgsfs(1);
+      pgsci(1);
+    }
+
+    pgclos();
+
+    # write data file, needs its own subroutine
+    if ($opts{rdb}) {
+	my $rdbfile = $opts{outbase}."_data_${\($i+1)}.rdb";
+	open(RDB,">$rdbfile") or
+	    _error("could not open RDB output file '$rdbfile': $!");
+	print RDB <<EOP;
+#
+# $rdbfile;
+# created by $0: ${\(scalar localtime())}
+#
+# command: $0 @argv_save
+#
+# used exposure time: ${\(sprintf "%d", $exposure)} sec
+# compounded deadtime factor: ${\(sprintf "%.3f", $compound_dtf)}
+#
+# timebin: $opts{timebin} (s)
+# area_ratio: $area_ratio
+# source_radius: ${\(sprintf "%.1f",$radius)}
+# backgroud_radius_inner: ${\(sprintf "%.1f",$annulus_inner)}
+# backgroud_radius_outer: ${\(sprintf "%.1f",$annulus_outer)}
+#
+# rates are background-subtracted and corrected for deadtime
+#
+time	bin	rate	rate_err	src	bg	dtf	dtf_err
+N	N	N	N	N	N	N	N
+EOP
+    wcols("%.1f\t%.1f\t%.2f\t%.2f\t%d\t%d\t%.3f\t%.3f",
+	  $timebin_values_good,
+	  $timebin_sizes_good,
+	  $lc_final_hist,
+	  $lc_final_sigma,
+	  $src_hist,
+	  $bg_hist*$area_ratio,
+	  $dtf_hist,
+	  $dtf_sigma,
+	  *RDB
+	  );
+	close RDB;
+    }
+
+}
+
+exit 0;
+
+sub get_psfs {
+    my @offaxis = @{(shift)};
+    my $psf_file = shift;
+    my ($psf_offaxis, $psf_tables) = @_;
+
+    my $fptr;
+    my $status = 0;
+    $fptr = Astro::FITS::CFITSIO::open_file($psf_file,Astro::FITS::CFITSIO::READONLY(),$status);
+    check_status($status) or _error("could not open PSF file '$psf_file'");
+
+    # foreach offaxis value, look at the upper and lower bounding tables,
+    # interpolate between them
+
+    my @radii;
+    for (my $i=0; $i<@offaxis; $i++) {
+	my ($psf_offaxis_low_ind, $psf_offaxis_high_ind);
+	if ($psf_offaxis->min > $offaxis[$i]) {
+	    _logit("offaxis index $i (offaxis=".(sprintf "%d",$offaxis[$i]).") is less than minimum in PSF table (${\($psf_offaxis->min)})");
+	    $psf_offaxis_low_ind = $psf_offaxis->minimum_ind;
+	    $psf_offaxis_high_ind = $psf_offaxis_low_ind+1;
+	}
+	elsif ($psf_offaxis->max < $offaxis[$i]) {
+	    _logit("offaxis index $i (offaxis=".(sprintf "%d",$offaxis[$i]).") is greater than maximum in PSF table (${\($psf_offaxis->max)})");
+	    $psf_offaxis_low_ind = $psf_offaxis->maximum_ind-1;
+	    $psf_offaxis_high_ind = $psf_offaxis_low_ind+1;
+	}
+	else {
+	    my $index = which($psf_offaxis < $offaxis[$i]);
+	    $psf_offaxis_low_ind = $index->at(maximum_ind($psf_offaxis->index($index)));
+	    $psf_offaxis_high_ind = $psf_offaxis_low_ind+1;
+	}
+
+	my ($psf_offaxis_low,$psf_offaxis_high) = ($psf_offaxis->at($psf_offaxis_low_ind),$psf_offaxis->at($psf_offaxis_high_ind));
+	_logit(sprintf "offaxis=%d, psf_offaxis_low=%d, psf_offaxis_high=%d", $offaxis[$i], $psf_offaxis_low, $psf_offaxis_high);
+
+	my ($radius_low,$fraction_low) =
+	    read_bintbl_cols($fptr,'radius','fraction',{extname=>$psf_tables->[$psf_offaxis_low_ind]});
+
+	my $rlow = $opts{eefactor}*$radius_low->at(which($fraction_low>0.80)->at(0));
+
+	my ($radius_high,$fraction_high) =
+	    read_bintbl_cols($fptr,'radius','fraction',{extname=>$psf_tables->[$psf_offaxis_high_ind]});
+
+	my $rhigh = $opts{eefactor}*$radius_high->at(which($fraction_high>0.80)->at(0));
+
+	my $radius = interpol(
+			      $offaxis[$i],
+			      pdl([$psf_offaxis_low,$psf_offaxis_high]),
+			      pdl([$rlow,$rhigh])
+
+			      )->at;
+	push @radii, $radius;
+
+    }
+
+    $fptr->close_file($status);
+
+    return @radii;
+}
+
+sub get_psf_tables {
+  my $file = shift;
+  my $hdr = shift;
+
+  # figure out which table we want
+  my ($det,$g,$tbl) = read_bintbl_cols($file,'detector','grating','table',{extname=>'psfsize'}) or
+    _error("error reading PSFSIZE hdu in file '$file'");
+  my $hdunam = '';
+  my $grating = $hdr->{GRATING};
+  my $detector = $hdr->{DETNAM};
+  $grating =~ s/^\s*\'\s*(.*?)\s*\'\s*$/$1/;
+  $detector =~ s/^\s*\'\s*(.*?)\s*\'\s*$/$1/;
+  $detector =~ s/\-\d+$/-S/; # strange case
+
+  # lookup table has [LMH]EG
+  # don't handle the HETG cases since we need a way of getting the
+  # shutters in use
+  $grating =~ /LETG/ and $grating = 'LEG';
+
+  #
+  # hack time
+  #
+  if ($grating ne 'NONE') {
+    _logit("Warning! Grating was '$grating', changing to 'NONE'.");
+    $grating = 'NONE';
+  }
+
+  for (my $i=0; $i<@$det; $i++) {
+    if ($det->[$i] eq $detector and $g->[$i] eq $grating) {
+      $hdunam = $tbl->[$i];
+      _logit("using PSF lookup table '$hdunam'");
+      last;
+    }
+  }
+  $hdunam or _error("no PSF HDU found for detector=$detector, grating=$grating");
+
+  # read the data, ignore energy for now, use defocus=0
+  my ($defocus,$energies,$thetas,$tables) = read_bintbl_cols($file,'defocus','energy','theta','table',{extname=>$hdunam}) or
+    _error("error reading PSF data hdu '$hdunam' in file '$file'");
+  my $index = which($defocus == 0);
+  $index->nelem or _error("PSF file '$file' has no data with defocus=0");
+  $thetas = $thetas->index($index);
+  $energies = $energies->index($index);
+  @{$tables} = @{$tables}[$index->list];
+
+  # take the first energy we come across
+  $index = which($energies == $energies->at(minimum_ind(abs($energies-$target_energy))));
+  $thetas = $thetas->index($index);
+  @{$tables} = @{$tables}[$index->list];
+
+  $thetas *= 60.0; # convert to arcsec
+
+  return ($thetas,$tables);
+}
+
+sub get_regions {
+  my $fptr = shift;
+
+  my ($ra,$dec,$x,$y);
+
+  if (defined $opts{cellfile}) {
+    _logit("using region file '$opts{cellfile}'");
+
+    print STDERR "Reading cellfile FITS data...";
+    ($ra,$dec,$x,$y) =
+      read_bintbl_cols($opts{cellfile},qw( ra dec x y ),{status=>1, extname=>'SRCLIST'}) or
+	_error("error reading region file '$opts{cellfile}'");
+    print STDERR " done\n";
+
+    my $cellrows = sequence($ra->nelem) + 1;
+    if (defined $opts{cellrows}) {
+      $cellrows = short split(',',$opts{cellrows});
+
+      $cellrows->nelem or
+	_error("given cellrows = '$opts{cellrows}' is empty");
+
+      $cellrows->min >= 1 and $cellrows->max <= $ra->nelem or
+	_error("cellrows = '$opts{cellrows}' is out of range (total of ${\($ra->nelem)} sources)");
+
+      foreach ($ra,$dec,$x,$y) {
+	$_ = $_->index($cellrows-1);
+      }
+    }
+    _logit('using regions '.join(',',$cellrows->list));
+  }
+
+  if (defined $opts{xy}) {
+
+    my ($xcolnum, $ycolnum, $hdr, $status);
+    $fptr->get_colnum(0,'x',$xcolnum,$status=0);
+    $fptr->get_colnum(0,'y',$ycolnum,$status);
+    $fptr->get_table_wcs_keys($xcolnum,$ycolnum,$hdr,$status);
+    check_status($status) or
+      _error("error obtaining WCS information");
+
+    my $wcs = WCSTools::LibWCS::wcsinit($hdr);
+
+    foreach my $xy (@{$opts{xy}}) {
+      my ($thisx,$thisy) = split ',', $xy;
+
+      my ($thisra, $thisdec);
+      $wcs->pix2wcs($thisx, $thisy, $thisra, $thisdec);
+
+
+      if (! defined $ra) {	# outputs not initialized yet
+	$ra = zeroes(1) + $thisra;
+	$dec = zeroes(1) + $thisdec;
+	$x = zeroes(1) + $thisx;
+	$y = zeroes(1) + $thisy;
+      } else {
+	$ra = $ra->append(zeroes(1) + $thisra);
+	$dec = $dec->append(zeroes(1) + $thisdec);
+	$x = $x->append(zeroes(1) + $thisx);
+	$y = $y->append(zeroes(1) + $thisy);
+      }
+    }
+    $wcs->free;
+  }
+
+  defined ($ra) or
+    _error("must give --cellfile or --xy option");
+
+  return ($ra,$dec,$x,$y);
+}
+
+# print a message
+sub _logit {
+  my $message = shift;
+  my $subroutine = (caller 1)[3];
+  defined $subroutine or $subroutine = 'main';
+  $message = $subroutine.'() - '.$message;
+  print STDERR $message,"\n";
+}
+
+# print an error message and exit
+sub _error {
+  my $message = shift;
+  my $subroutine = (caller 1)[3];
+  defined $subroutine or $subroutine = 'main';
+  $message = $subroutine.'() - '.$message.'...fatal';
+  croak $message;
+}
+
+sub _read_gti {
+  my $file = shift;
+
+  my ($start,$stop) = read_bintbl_cols($file,'start','stop',{status=>1,extname=>'gti'});
+  (defined $start and defined $stop and $start->nelem == $stop->nelem) or do {
+    _logit("error reading GTI file");
+    return;
+  };
+  return ($start,$stop);
+}
+
+sub version {
+  print <<EOP;
+$0, version $VERSION
+EOP
+  exit 0;
+}
+
+sub help {
+  print <<EOP;
+Usage: $0 [options] evtfile.fits
+
+Creates a light curve from source position and event data.
+Input is expected to consist of an L1 event list (sky X,Y)
+and the file output by the 'celldetect' program. Use --cellfile
+to specify the celldetect output pathname. By default all
+sources listed in the given celldetect output file are
+processed. You can change this behaviour by using the --cellrows
+option (e.g., --cellist=1,3 to process the first and third
+sources only).
+
+An optional method for specifying the source regions to use is with
+the --xy option. This option should be given a comma-separated
+sky X/Y coordinate, and may be given more than once for multiple
+source regions. For example, --xy=1234.5,6789.0 --xy=9876,5432
+
+Output of the program consists of a series of plots in Postscript
+format. The name of the plot files is, by default, ./lcurve_visuals_N.ps
+where 'N' is the source number (one file for each source processed.
+Other outputs include RDB files containing the calculated light curve.
+These names are of the form './lcurve_data_N.rdb'.
+
+All output file basenames can be changed with the --outbase option
+(e.g., --outbase='./lcurve_outputs/obsid62435_lcurve' (ensure
+the './lcurve_outputs' directory exists in this case)). The default
+output file basename is './lcurve'. Thus --outbase=obsidXXX would
+create files 'obsidXXX_visuals_N.ps' and 'obsidXXX_data_N.rdb'.
+
+The background and source radii are currently obtained from a list
+of modeled PSFs. These should also be user-configurable, and soon
+will be.
+
+  --help,-h       Show help and exit.
+  --version       Print version information and exit.
+  --cellfile      Location of celldetect output file.
+  --cellrows      Comma-separated list of sources to use (default is all).
+  --xy            X,Y (sky) coordinates of sources, can be given more than
+                  once for multiple sources. Example, --xy=16812.5,14351.1
+  --extname       Extension name in events FITS file (default is 'events').
+  --timebin       Time binning value (default is 100 seconds).
+  --rfilter       Row filter to apply to event list.
+  --outbase       Basename of output files (default is './lcurve').
+  --nordb         Do not create output RDB files.
+  --eefactor      80% EE factor to use for source radius (default=5).
+  --dtffile       Deadtime-correction FITS file. No corrections made if
+                  this file is not given.
+  --psffile       Specify alternate PSF sizes datafile.
+  --gtifile       Good-times interval file. Default behaviour is to read
+                  the GTI list from the specified events file, unless
+                  this option is given.
+  --nogti         Do not read GTI from anywhere. Assume all events are valid.
+  --truncate      Remove this many seconds from start and end. Useful
+                  since HRC HV ramp aren't presently being taken
+                  out of the GTI list properly.
+  --bgratio       Area ratio to use for background annulus (default is
+                  $default_opts{bgratio}).
+  --chipplot      Plot chip coordinates
+
+BUGS:
+
+  * Does not properly handle grating. Uses PSF for detector without grating
+    instead.
+
+AUTHOR:
+  Pete Ratzlaff <pratzlaff\@cfa.harvard.edu>
+
+EOP
+
+  exit 0;
+}
+
+sub _find_psf_file {
+
+  if (defined $opts{psffile}) {
+    (-f $opts{psffile} and -r _) or die "$0: specified PSF file is unreadable ('$opts{psffile}')\n";
+    return $opts{psffile};
+  }
+
+  defined $ENV{ASCDS_INSTALL} or
+    die "$0: --psffile unspecified, and \$ASCDS_INSTALL not set\n";
+
+  my @files = glob($ENV{ASCDS_INSTALL} . '/data/psfsize*.fits') or
+    die "$0: no possible PSF size files found in $ENV{ASCDS_INSTALL}/data\n";
+
+  # some possible file names are psfsize_20000830.fits, psfsize20010416 and
+  # psfsize.fits, so we'll strip out possible underscores, and rely on the
+  # psfsize20010416 > psfsize20000830 > psfsize (in string comparison
+  # operations) to find the latest file
+  my @files_copy = @files;
+  tr/_//d for @files_copy;
+
+  my $max_index = _max_index_str(@files_copy);
+
+  return $files[$max_index];
+}
+
+sub _max_index_str {
+  my $max_index = 0;
+  my $max = shift;
+
+  for (0..$#_) {
+    if ($_[$_] gt $max) {
+      $max = $_[$_];
+      $max_index = $_;
+    }
+  }
+  return $max_index;
+}

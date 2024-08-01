@@ -1,0 +1,309 @@
+#!/bin/sh
+#
+# add_grating_orders
+
+if [ "$#" -ne 8 ]; then
+echo 
+echo "This script adds together positive and negative order source and \
+background ACIS-HETG/LETG or HRC-LETG spectra and ARFs, and group the \
+coadded spectrum."
+  echo
+  echo "Usage:"
+  echo
+  echo "$0 pha2 order garm garf_negative garf_positive group_type \
+group_spec root"
+  echo
+  echo "Where:"
+  echo "pha2: is the type 2 pha file output from tgextract"
+  echo "order: is the order of the grating spectra to extract"
+  echo "arm: is the grating arm to extract the spectrum from (HEG, MEG or LEG)"
+  echo "garf_negative/positive: are the grating ARF for negative and \
+positive orders for the HEG|MEG|LEG grating"
+  echo "group_type: is the grouping type (NONE|BIN|SNR|NUM_BINS|NUM_CTS|ADAPTIVE; see the dmgroup documentation for help)" 
+  echo "group_spec: is the grouping specification (see the dmgroup documentation for help)"
+  echo "root: is the root name for the output files"
+  echo
+  echo "EXAMPLES:"  
+  echo ""
+  echo "add_grating_orders acis_pha2.fits 1 HEG HEG_-1_garf.fits HEG_1_garf.fits BIN 10 spec"
+  echo ""
+#  echo "In this example the script will produce one pha file named 'acis_HEG_1_grp10.pha' and an ARF file named 'acis_HEG_1.arf'"
+  exit 1
+fi
+
+pha2=$1
+order=$2
+garm=$3
+garfm=$4
+garfp=$5
+gtype=$6
+gbin=$7
+root=$8
+
+# check files' existence before doing anything:
+#
+if [ ! -f $pha2 -a ! -f $pha2.gz ]; then
+  echo "Error.  File $pha2 not found."
+  exit 1
+fi 
+#
+#
+if [ ! -f $garfm -a ! -f $garfm.gz ]; then
+  echo "Error.  File $garfm not found."
+  exit 1
+fi 
+#
+#
+if [ ! -f $garfp -a ! -f $garfp.gz ]; then
+  echo "Error.  File $garfp not found."
+  exit 1
+fi 
+
+if [ "$garm" = "HEG" -o "$garm" = "heg" ]; then 
+    basebin=0.0025
+    basebin=`echo "scale=10; $basebin / $order" | bc`
+    garm="HEG"
+fi
+if [ "$garm" = "MEG" -o "$garm" = "meg" ]; then 
+    basebin=0.005
+    basebin=`echo "scale=10; $basebin / $order" | bc`
+    garm="MEG"
+fi
+
+if [ "$garm" = "LEG" -o "$garm" = "leg" ]; then 
+    basebin=0.0125
+    basebin=`echo "scale=10; $basebin / $order" | bc`
+    garm="LEG"
+fi
+
+echo
+echo "Input pha2 file is: $pha2"
+echo "Using $garm grating ARF order $order: $garfm"
+echo "Using $garm grating ARF order $order: $garfp"
+echo "The root filename for the output file is: $root"
+echo
+
+instrument=`dmlist $pha2 header,clean | grep INSTRUME | awk '{print $2}' | head -1`
+
+if [ "$gtype" = "BIN" -o "$gtype" = "bin" ]; then 
+    gtype="BIN"
+    group=`echo "scale=4; $basebin * $gbin" | bc`
+    gkey1="binspec"
+    gkey2="grouptypeval"
+    if [ "$instrument" = "ACIS" ]; then
+	gbinstring="1:8192:$gbin"
+    fi 
+    if [ "$instrument" = "HRC" ]; then
+	gbinstring="1:16384:$gbin"
+    fi 
+    gbinst="$gtype$gbin"
+echo
+echo "$garm spectrum will be grouped by $gbin = $group Angstrom"
+elif [ "$gtype" = "NONE" -o "$gtype" = "none" ]; then 
+    gtype="NONE" 
+    gbinst=$gtype
+    echo 
+    echo "$garm spectrum will not be grouped."
+elif [ "$gtype" = "SNR" -o "$gtype" = "snr" ]; then 
+    gtype="SNR" 
+    gkey1="grouptypeval"
+    gkey2="binspec"
+    gbinstring=$gbin
+    gbinst="$gtype$gbin"
+    echo
+    echo "$garm spectrum will be grouped with a $gtype > $gbin per bin."
+elif [ "$gtype" = "NUM_BINS" -o "$gtype" = "num_bins" ]; then 
+    gtype="NUM_BINS"
+    gkey1="grouptypeval"
+    gkey2="binspec"
+    gbinstring=$gbin
+    gbinst="$gtype$gbin"
+    echo 
+    echo "$garm spectrum will be grouped in $gbin new bins."
+elif [ "$gtype" = "NUM_CTS" -o "$gtype" = "num_cts" ]; then 
+    gtype="NUM_CTS" 
+    gkey1="grouptypeval"
+    gkey2="binspec"
+    gbinstring=$gbin
+    gbinst="$gtype$gbin"
+    echo 
+    echo "$garm spectrum will be grouped with a $gtype > $gbin per bin."
+elif [ "$gtype" = "ADAPTIVE" -o "$gtype" = "adaptive" ]; then 
+    gtype="ADAPTIVE" 
+    gkey1="grouptypeval"
+    gkey2="binspec"
+    gbinstring=$gbin
+    gbinst="$gtype$gbin"
+    echo
+    echo "$garm spectrum will be grouped with an $gtype binning." 
+    echo "WARNING: THE ADAPTIVE GROUPING MAY TAKE VERY LONG..."
+else 
+    echo 
+    echo "Error! The grouping type must be one of the following: \
+NONE|BIN|SNR|NUM_BINS|NUM_CTS|ADAPTIVE"
+    exit 1
+fi
+
+if [ "$order" = "1" -a "$garm" = "HEG" ]; then 
+rowm=3
+rowp=4
+fi
+if [ "$order" = "2" -a "$garm" = "HEG" ]; then 
+rowm=2
+rowp=5
+fi
+if [ "$order" = "3" -a "$garm" = "HEG" ]; then 
+rowm=1
+rowp=6
+fi
+
+if [ "$order" = "1" -a "$garm" = "MEG" ]; then 
+rowm=9
+rowp=10
+fi
+if [ "$order" = "2" -a "$garm" = "MEG" ]; then 
+rowm=8
+rowp=11
+fi
+if [ "$order" = "3" -a "$garm" = "MEG" ]; then 
+rowm=7
+rowp=12
+fi
+
+if [ "$order" = "1" -a "$garm" = "LEG" -a "$instrument" = "ACIS" ]; then 
+rowm=3
+rowp=4
+fi
+if [ "$order" = "1" -a "$garm" = "LEG" -a "$instrument" = "HRC" ]; then 
+rowm=1
+rowp=2
+fi
+if [ "$order" = "2" -a "$garm" = "LEG" -a "$instrument" = "ACIS" ]; then 
+rowm=2
+rowp=5
+fi
+if [ "$order" = "2" -a "$garm" = "LEG" -a "$instrument" = "HRC" ]; then 
+echo "Errors! Only orders +/- 1 are allowed for $instrument-$garm"
+exit 1
+fi
+if [ "$order" = "3" -a "$garm" = "LEG" -a "$instrument" = "ACIS" ]; then 
+rowm=1
+rowp=6
+fi
+if [ "$order" = "3" -a "$garm" = "LEG" -a "$instrument" = "HRC" ]; then 
+echo "Errors! Only orders +/- 1 are allowed for $instrument-$garm"
+exit 1
+fi
+
+echo
+echo "Working on $garm spectra..."
+echo 
+echo "Splitting the pha2 file $pha2 in $garm +$order/-$order orders..."
+echo 
+dmtype2split infile=$pha2 outfile=${root}_${garm}_m${order}.pha_tmp rows=$rowm clobber=yes verbose=0 mode=ql
+dmtype2split infile=$pha2 outfile=${root}_${garm}_p${order}.pha_tmp rows=$rowp clobber=yes verbose=0 mode=ql
+
+echo 
+echo "Renaming columns of the pha1 files ${root}_${garm}_m${order}.pha_tmp and ${root}_${garm}_p${order}.pha_tmp..."
+echo 
+
+dmtcalc infile=${root}_${garm}_m${order}.pha_tmp outfile=${root}_${garm}_m${order}.pha_tmp expression=COUNTS_M=COUNTS kernel=default clobber=yes verbose=0 mode=ql
+
+dmtcalc infile=${root}_${garm}_m${order}.pha_tmp outfile=${root}_${garm}_m${order}.pha_tmp expression=BACKGROUND_UP_M=BACKGROUND_UP kernel=default clobber=yes verbose=0 mode=ql
+
+dmtcalc infile=${root}_${garm}_m${order}.pha_tmp outfile=${root}_${garm}_m${order}.pha_tmp expression=BACKGROUND_DOWN_M=BACKGROUND_DOWN kernel=default clobber=yes verbose=0 mode=ql
+
+dmtcalc infile=${root}_${garm}_m${order}.pha_tmp outfile=${root}_${garm}_m${order}.pha_tmp expression=STAT_ERR_M=STAT_ERR kernel=default clobber=yes verbose=0 mode=ql
+
+dmtcalc infile=${root}_${garm}_p${order}.pha_tmp outfile=${root}_${garm}_p${order}.pha_tmp expression=COUNTS_P=COUNTS kernel=default clobber=yes verbose=0 mode=ql
+
+dmtcalc infile=${root}_${garm}_p${order}.pha_tmp outfile=${root}_${garm}_p${order}.pha_tmp expression=BACKGROUND_UP_P=BACKGROUND_UP kernel=default clobber=yes verbose=0 mode=ql
+
+dmtcalc infile=${root}_${garm}_p${order}.pha_tmp outfile=${root}_${garm}_p${order}.pha_tmp expression=BACKGROUND_DOWN_P=BACKGROUND_DOWN kernel=default clobber=yes verbose=0 mode=ql
+
+dmtcalc infile=${root}_${garm}_p${order}.pha_tmp outfile=${root}_${garm}_p${order}.pha_tmp expression=STAT_ERR_P=STAT_ERR kernel=default clobber=yes verbose=0 mode=ql
+
+dmpaste infile="${root}_${garm}_p${order}.pha_tmp[SPECTRUM][cols CHANNEL,BIN_LO,BIN_HI,COUNTS_P,BACKGROUND_UP_P,BACKGROUND_DOWN_P,STAT_ERR_P]" pastefile="${root}_${garm}_m${order}.pha_tmp[SPECTRUM][cols COUNTS_M,BACKGROUND_UP_M,BACKGROUND_DOWN_M,STAT_ERR_M]" outfile=${root}_${garm}_${order}.pha clobber=yes verbose=0 kernel=default mode=ql
+
+echo
+echo "Adding +$order/-$order orders..."
+echo
+
+dmtcalc infile=${root}_${garm}_${order}.pha outfile=${root}_${garm}_${order}.pha expression="COUNTS=COUNTS_M+COUNTS_P" kernel=default clobber=yes verbose=0 mode=ql
+
+dmtcalc infile=${root}_${garm}_${order}.pha outfile=${root}_${garm}_${order}.pha expression="BACKGROUND_UP=(BACKGROUND_UP_M+BACKGROUND_UP_P)" kernel=default clobber=yes verbose=0 mode=ql
+
+dmtcalc infile=${root}_${garm}_${order}.pha outfile=${root}_${garm}_${order}.pha expression="BACKGROUND_DOWN=(BACKGROUND_DOWN_M+BACKGROUND_DOWN_P)" kernel=default clobber=yes verbose=0 mode=ql
+
+dmtcalc infile=${root}_${garm}_${order}.pha outfile=${root}_${garm}_${order}.pha expression="STAT_ERR=(1+sqrt(COUNTS+0.75))" kernel=default clobber=yes verbose=0 mode=ql
+
+echo
+echo "Filtering data files and building $garm order=$order spectrum ${root}_${garm}_${order}.pha"
+echo
+
+dmcopy "${root}_${garm}_${order}.pha[SPECTRUM][cols CHANNEL,COUNTS,STAT_ERR,BACKGROUND_UP,BACKGROUND_DOWN,BIN_LO,BIN_HI]" outfile=${root}_${garm}_${order}.pha clobber=yes mode=ql
+
+echo
+echo "Working on $garm Effective Areas..."
+echo
+
+dmtcalc infile="${garfm}[SPECRESP]" outfile=${root}_${garm}_m${order}.arf_tmp expression=SPECRESP_M=SPECRESP kernel=default clobber=yes verbose=0 mode=ql
+
+dmtcalc infile="${garfp}[SPECRESP]" outfile=${root}_${garm}_p${order}.arf_tmp expression=SPECRESP_P=SPECRESP kernel=default clobber=yes verbose=0 mode=ql
+
+dmpaste infile="${root}_${garm}_p${order}.arf_tmp[SPECRESP][cols ENERG_LO,ENERG_HI,SPECRESP_P,BIN_LO,BIN_HI]" pastefile="${root}_${garm}_m${order}.arf_tmp[SPECRESP][cols SPECRESP_M]" outfile=${root}_${garm}_${order}.arf clobber=yes verbose=0 kernel=default mode=ql
+
+echo
+echo "Adding +$order/-$order orders..."
+echo
+
+dmtcalc infile=${root}_${garm}_${order}.arf outfile=${root}_${garm}_${order}.arf expression="SPECRESP=(SPECRESP_M+SPECRESP_P)" kernel=default clobber=yes verbose=0 mode=ql
+
+echo
+echo "Filtering data file and building $garm order=$order effective area ${root}_${garm}_${order}.arf..." 
+
+dmcopy "${root}_${garm}_${order}.arf[SPECRESP][cols ENERG_LO,ENERG_HI,SPECRESP,BIN_LO,BIN_HI]" outfile="${root}_${garm}_${order}.arf" clobber=yes mode=ql
+
+if [ "$gtype" != "NONE" ]; then 
+    echo
+    echo "Grouping $garm order=$order pha spectrum..."
+    echo
+
+    dmgroup infile="${root}_${garm}_${order}.pha[SPECTRUM]" outfile=${root}_${garm}_${order}_${gbinst}.pha $gkey1=$gbinstring $gkey2="" tabspec='' grouptype=$gtype column='counts' bincolumn="channel" tabcolumn="" clobber=yes verbose='0' mode='ql'
+else 
+    mv ${root}_${garm}_${order}.pha ${root}_${garm}_${order}_${gbinst}.pha
+fi
+
+dmhedit infile=${root}_${garm}_${order}_${gbinst}.pha operation=add key=ANCRFILE value=${root}_${garm}_${order}.arf filelist=""
+
+if [ "$instrument" = "ACIS" ]; then 
+    dmhedit infile=${root}_${garm}_${order}_${gbinst}.pha operation=add key=BACKSCUP value=4.5 filelist=""
+    dmhedit infile=${root}_${garm}_${order}_${gbinst}.pha operation=add key=BACKSCDN value=4.5 filelist=""
+elif [ "$instrument" = "HRC" ]; then 
+    dmhedit infile=${root}_${garm}_${order}_${gbinst}.pha operation=add key=BACKSCUP value=5.0 filelist=""
+    dmhedit infile=${root}_${garm}_${order}_${gbinst}.pha operation=add key=BACKSCDN value=5.0 filelist=""
+fi 
+
+echo "Cleaning up..."
+/bin/rm ${root}*_tmp
+if [ "$gtype" != "NONE" ]; then 
+    /bin/rm ${root}_${garm}_${order}.pha
+fi
+echo "Done."
+
+echo
+echo "The coadded, grouped output spectrum is named \
+${root}_${garm}_${order}_${gbinst}.pha"
+echo "The coadded Effective Area is named ${root}_${garm}_${order}.arf"
+
+echo
+echo "You may now want to read both the $garm order=$order spectrum and \
+effective area (${root}_${garm}_${order}_${gbinst}.pha and \
+${root}_${garm}_${order}.arf) in sherpa, and fit the data." 
+echo "The commands in sherpa are:"
+echo
+echo "data ${root}_${garm}_${order}_${gbinst}.pha"
+echo "rsp[arfname](,${root}_${garm}_${order}.arf,)"
+echo "instrument = arfname"
+
+

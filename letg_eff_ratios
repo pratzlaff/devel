@@ -1,0 +1,24 @@
+#! /usr/bin/perl -w
+use strict;
+
+use Chandra::Models qw( LETG_eff );
+use PDL;
+use PDL::Graphics::PGPLOT;
+
+my ($e, @orders) = LETG_eff(1..7);
+
+$_ = pdl $_ for $e, @orders;
+
+line ($e, $orders[0]);
+
+my @output = map { $_ / $orders[0] } @orders[1..$#orders];
+
+my @cols = qw( energy ratio_2_1 ratio_3_1 ratio_4_1 ratio_5_1 ratio_6_1 ratio_7_1);
+
+print join("\t", @cols),"\n";
+print join("\t", ('N')x@cols),"\n";
+
+$PDL::IO::Misc::colsep = '';
+wcols "%.4g".("\t%.4g"x6), $e, @output;
+
+exit 0;

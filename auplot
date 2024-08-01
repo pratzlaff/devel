@@ -1,0 +1,100 @@
+#! /usr/bin/perl -w
+use strict;
+use lib '/home/rpete/local/perlmods';
+
+use PDL;
+use PGPLOT;
+use Chandra::Tools::Common;
+use Getopt::Long;
+use Carp;
+
+$| = 1;
+
+BEGIN {
+    my $hostname = (split /\./, `hostname`)[0]; chomp $hostname;
+    if ($hostname ne 'legs') {
+	$ENV{LD_LIBRARY_PATH} = '/opt/X11R6/lib:'.($ENV{LD_LIBRARY_PATH} ? $ENV{LD_LIBRARY_PATH} : '');
+	$ENV{PGPLOT_DIR} = '/home/rpete/local/pgplot';
+	$ENV{PGPLOT_FONT} = '/home/rpete/local/pgplot/grfont.dat';
+    }
+};
+
+my $VERSION = '0.1';
+
+$PDL::Graphics::PGPLOT::AXISCOLOUR = 1;
+$PDL::Graphics::PGPLOT::HARD_CH = 1;
+$PDL::Graphics::PGPLOT::HARD_LW = 1;
+$PDL::Graphics::PGPLOT::HARD_FONT = 1;
+
+my %opts = (
+	    'dev' => '?',
+	    );
+GetOptions(\%opts,
+	   'help!', 'version!', 'dev=s', 'av!',
+	   ) or usage();
+$opts{help} and usage();
+$opts{version} and version();
+
+@ARGV == 1 or usage();
+my $file = shift;
+
+print STDERR "Reading event list '$file'...";
+
+my @cols = qw( au1 au2 au3 );
+my $xtitle = 'au2/(au1+au2+au3)';
+my $ytitle = '(au3-au1)/(au1+au2+au3)';
+my @xlimits = (0.45, 0.80);
+my @ylimits = (-0.5, 0.5);
+
+if ($opts{av}) {
+    @cols = qw( av1 av2 av3 );
+    $xtitle = 'av2/(av1+av2+av3)';
+    $ytitle = '(av3-av1)/(av1+av2+av3)';
+    @xlimits = (0.45, 0.85);
+    @ylimits = (-0.5, 0.5);
+}
+my ($au1, $au2, $au3) = read_bintbl_cols($file,@cols,{status=>1,extname=>'events'});
+defined $au1 or croak "could not get data from event list in file '$file'";
+print " done\n";
+
+#(au3-au1)/(au1+au2+au3) vs. au2/(au1+au2+au3)
+
+pgbeg(0,$opts{dev},0,0);
+pgenv($xlimits[0], $xlimits[1], $ylimits[0], $ylimits[1],0,0);
+pgpt($au2->nelem,
+       ($au2/($au1+$au2+$au3)->float)->badmask(2*$xlimits[0]+$xlimits[1])->float->get_dataref,
+       (($au3-$au1)/($au1+$au2+$au3)->float)->badmask(2*$ylimits[0]+$ylimits[1])->float->get_dataref,
+       1
+       );
+pglab($xtitle, $ytitle, ,$file);
+pgclos();
+
+exit 0;
+
+sub version {
+    print STDERR "$0, version $VERSION\n";
+    exit 0;
+}
+
+sub usage {
+    my $usage = "Usage: $0 [options] evtfile";
+
+    print STDERR <<EOP;
+$usage
+
+  Creates a plot of (au3-au1)/(au1+au2+au3) vs. au2/(au1+au2+au3) for
+  the given event list.
+
+  Options:
+  --help       This message.
+  --version    Print version information and exit.
+  --dev        PGPLOT device to use.
+  --av         Plot av[123] instead of au[123].
+
+  Author:
+    Pete Ratzlaff <pratzlaff\@cfa.harvard.edu>
+
+$usage
+EOP
+    exit 1;
+}
